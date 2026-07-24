@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-web-sync",
+  "name": "Obsidian Web — Redis Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Save and sync your vault to/from Redis. Only visible on obsidian-web (the web wrapper).",
+  "author": "obsidian-web",
+  "isDesktopOnly": false
+}

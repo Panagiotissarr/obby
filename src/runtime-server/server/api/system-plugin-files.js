@@ -41,7 +41,7 @@ const MIME_BY_EXT = {
 //   SYSTEM_PLUGINS_SEED='obsidian-web-layout'          (comma list — seeded + enabled)
 //   SYSTEM_PLUGINS_SEED_DISABLED='obsidian-livesync'   (comma list — seeded, NOT enabled)
 function parseList(v) { return (v || '').split(',').map((s) => s.trim()).filter(Boolean); }
-const SEED_ENABLED = new Set(parseList(process.env.SYSTEM_PLUGINS_SEED || 'obsidian-web-layout'));
+const SEED_ENABLED = new Set(parseList(process.env.SYSTEM_PLUGINS_SEED || 'obsidian-web-layout,obsidian-web-sync'));
 const SEED_DISABLED = new Set(parseList(process.env.SYSTEM_PLUGINS_SEED_DISABLED));
 
 function createSystemPluginFilesRouter() {
