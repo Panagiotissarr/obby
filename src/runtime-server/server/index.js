@@ -228,8 +228,15 @@ function startServer(appConfig = config) {
   return server;
 }
 
-if (require.main === module) {
-  startServer();
+// Vercel Serverless entry point — export the Express app directly.
+// On Vercel there is no long-running HTTP server; the platform wraps the
+// Express app and invokes it per-request.
+if (process.env.VERCEL) {
+  systemPlugins.init();
+  module.exports = createApp();
+} else {
+  if (require.main === module) {
+    startServer();
+  }
+  module.exports = { createApp, startServer };
 }
-
-module.exports = { createApp, startServer };
