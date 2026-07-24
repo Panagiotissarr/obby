@@ -1,7 +1,7 @@
 {
   "version": 2,
   "outputDirectory": ".",
-  "buildCommand": "npm run vercel-build",
+  "installCommand": "npm install && node scripts/update-obsidian-mobile.js && cd src/runtime-server/server && npm install",
   "functions": {
     "api/index.js": {
       "maxDuration": 30,
