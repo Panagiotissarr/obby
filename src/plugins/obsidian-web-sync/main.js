@@ -16,8 +16,7 @@
 const obsidian = require('obsidian');
 
 function getVaultId() {
-  // VAULT_ID is set by boot.js as a global
-  return window.VAULT_ID || '';
+  return window.__owVaultId || window.VAULT_ID || '';
 }
 
 function doSave() {
