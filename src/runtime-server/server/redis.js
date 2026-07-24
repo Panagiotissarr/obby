@@ -12,11 +12,11 @@ let _client = null;
 
 function getRedis() {
   if (!_client) {
-    const url = process.env.UPSTASH_REDIS_REST_URL;
-    const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+    const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+    const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
     if (!url || !token) {
       throw new Error(
-        'UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN must be set',
+        'KV_REST_API_URL and KV_REST_API_TOKEN must be set',
       );
     }
     _client = new Redis({ url, token });
