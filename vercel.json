@@ -4,12 +4,7 @@
   "functions": {
     "api/index.js": {
       "maxDuration": 30,
-      "includeFiles": [
-        "vendor/**",
-        "src/client-mobile/**",
-        "src/plugins/**",
-        "src/config/**"
-      ]
+      "includeFiles": "{vendor,src/client-mobile,src/plugins,src/config}/**"
     }
   },
   "routes": [
