@@ -25,6 +25,7 @@ const createBootstrapRouter = require('./api/bootstrap');
 const { warmUpBootstrapCache } = require('./api/bootstrap');
 const createProxyRouter = require('./api/proxy');
 const createSystemPluginFilesRouter = require('./api/system-plugin-files');
+const createVaultSyncRouter = require('./api/vault-sync');
 const attachWatchServer = require('./api/watch');
 const VaultRegistry = require('./vault-registry');
 
@@ -190,6 +191,7 @@ function createApp(appConfig = {}) {
   app.use('/api/proxy-request', createProxyRouter());
   app.use('/api/vaults', createVaultsRouter(vaultRegistry));
   app.use('/api/fs', createFsRouter(vaultRegistry, appConfig.vaultPath));
+  app.use('/api/vault', createVaultSyncRouter(vaultRegistry));
   app.use('/api/electron', createElectronRouter(vaultRegistry, appConfig.vaultPath));
   app.use('/api', createSystemPluginFilesRouter());
 

@@ -1025,6 +1025,130 @@ const MOBILE_SCRIPTS = [
       // ל-local/server).
       installFolderRefreshWatch();
 
+      // ── Redis sync: Save & Refresh context menu + toolbar buttons ────────
+      // Adds "Save to Redis" and "Refresh from Redis" to the file context
+      // menu (right-click / long-press) and to the file explorer toolbar.
+      // Only active for server vaults (VAULT_TYPE === 'server').
+      function installRedisSyncMenu() {
+        if (VAULT_TYPE !== 'server') return;
+
+        function doSave() {
+          if (!window.app || !window.app.vault) return;
+          var files = [];
+          var abstractFiles = window.app.vault.getFiles
+            ? Array.from(window.app.vault.getFiles())
+            : [];
+          abstractFiles.forEach(function (f) {
+            if (f && f.path && f.path.indexOf('.obsidian/plugins/') !== 0) {
+              var content = '';
+              try { content = window.app.vault.read(f); } catch (_) {}
+              files.push({ path: f.path, content: content });
+            }
+          });
+          fetch('/api/vault/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ vault: VAULT_ID, files: files }),
+          })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (typeof window.Notice === 'function') {
+              new window.Notice('Saved ' + (d.saved || 0) + ' files to Redis');
+            }
+            console.log('[ow] save to Redis:', d);
+          })
+          .catch(function (e) {
+            if (typeof window.Notice === 'function') {
+              new window.Notice('Save failed: ' + e.message);
+            }
+            console.warn('[ow] save failed', e);
+          });
+        }
+
+        function doRefresh() {
+          fetch('/api/vault/refresh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ vault: VAULT_ID }),
+          })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            window.__owBootstrapCache = null;
+            if (typeof window.Notice === 'function') {
+              new window.Notice('Refreshed from Redis (' + (d.fileCount || 0) + ' files)');
+            }
+            console.log('[ow] refresh from Redis:', d);
+          })
+          .catch(function (e) {
+            if (typeof window.Notice === 'function') {
+              new window.Notice('Refresh failed: ' + e.message);
+            }
+            console.warn('[ow] refresh failed', e);
+          });
+        }
+
+        // Context menu: register via Obsidian's workspace event
+        owWhenAppReady(function (app) {
+          if (app.workspace && typeof app.workspace.on === 'function') {
+            app.workspace.on('file-menu', function (menu) {
+              menu.addSeparator();
+              menu.addItem(function (item) {
+                item.setTitle('Save to Redis').setIcon('download').onClick(doSave);
+              });
+              menu.addItem(function (item) {
+                item.setTitle('Refresh from Redis').setIcon('refresh-cw').onClick(doRefresh);
+              });
+            });
+          }
+        });
+
+        // Toolbar buttons in file explorer (same pattern as folder-refresh)
+        var OW_SAVE_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="svg-icon lucide-download"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+        var OW_REFRESH_SYNC_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="svg-icon lucide-refresh-cw"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>';
+
+        function mountSyncButtons() {
+          var bars = document.querySelectorAll(
+            '.workspace-leaf-content[data-type="file-explorer"] .nav-buttons-container');
+          for (var i = 0; i < bars.length; i++) {
+            var bar = bars[i];
+            if (bar.querySelector('.ow-redis-save-btn')) continue;
+
+            var saveBtn = document.createElement('div');
+            saveBtn.className = 'clickable-icon nav-action-button ow-redis-save-btn';
+            saveBtn.setAttribute('aria-label', 'Save to Redis');
+            saveBtn.innerHTML = OW_SAVE_SVG;
+            saveBtn.addEventListener('click', function (e) {
+              e.preventDefault(); e.stopPropagation(); doSave();
+            });
+            bar.appendChild(saveBtn);
+
+            var refreshBtn = document.createElement('div');
+            refreshBtn.className = 'clickable-icon nav-action-button ow-redis-refresh-btn';
+            refreshBtn.setAttribute('aria-label', 'Refresh from Redis');
+            refreshBtn.innerHTML = OW_REFRESH_SYNC_SVG;
+            refreshBtn.addEventListener('click', function (e) {
+              e.preventDefault(); e.stopPropagation(); doRefresh();
+            });
+            bar.appendChild(refreshBtn);
+          }
+        }
+
+        owWhenAppReady(function (app) {
+          function whenWorkspace(tries) {
+            if (app.workspace) {
+              mountSyncButtons();
+              app.workspace.on('layout-change', mountSyncButtons);
+              return;
+            }
+            if ((tries || 0) >= 160) return;
+            setTimeout(function () { whenWorkspace((tries || 0) + 1); }, 50);
+          }
+          whenWorkspace(0);
+        });
+      }
+
+      installRedisSyncMenu();
+
       // ── שם-כספת מוצג מה-registry (docs/plans/vault-name-display.md §2/§3) ──
       // לכספת OPFS (local/folder) עם רשומת-registry, __owV.name הוא השם
       // שהמשתמשת נתנה; app.vault.getName() (basePath — ה-vault-id hash

@@ -5,11 +5,10 @@
  */
 
 const express = require('express');
-const fs = require('fs');
-const fsp = fs.promises;
 const os = require('os');
 const path = require('path');
 const config = require('../config');
+const { getRedis, treeKey, dataKey } = require('../redis');
 
 // Imported lazily to avoid circular require — same pattern as api/fs.js.
 function invalidateBootstrapCache(vaultId) {
@@ -50,22 +49,25 @@ function createElectronRouter(vaultRegistry, fallbackVaultRoot) {
   }
 
   // ipcRenderer.sendSync('trash', filePath)
-  // For now we just delete; later we can move to ~/.local/share/Trash.
+  // Redis-backed: delete the key and all children if directory.
   router.post('/trash', express.json(), async (req, res) => {
     try {
       const rel = req.body.path;
-      const vaultRoot = getVaultRoot(req);
-      const absolute = path.resolve(vaultRoot, '.' + path.sep + rel);
-      const resolvedRoot = path.resolve(vaultRoot);
-      if (absolute !== resolvedRoot && !absolute.startsWith(resolvedRoot + path.sep)) {
-        throw new Error('path escapes vault');
+      if (!rel || rel.includes('..')) throw new Error('path escapes vault');
+      const tid = req.body.vault || 'default';
+      const redis = getRedis();
+
+      // Check if directory (has children)
+      const prefix = rel + '/';
+      const allKeys = await redis.hkeys(treeKey(tid));
+      const toDelete = allKeys.filter(k => k === rel || k.startsWith(prefix));
+
+      const pipe = redis.pipeline();
+      for (const key of toDelete) {
+        pipe.hdel(treeKey(tid), key);
+        pipe.del(dataKey(tid, key));
       }
-      const stats = await fsp.stat(absolute);
-      if (stats.isDirectory()) {
-        await fsp.rm(absolute, { recursive: true, force: true });
-      } else {
-        await fsp.unlink(absolute);
-      }
+      await pipe.exec();
       invalidateBootstrapCache(req.body.vault);
       res.json({ ok: true });
     } catch (err) {

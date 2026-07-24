@@ -10,6 +10,7 @@
     "test": "node --test"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.0",
     "chokidar": "^3.6.0",
     "compression": "^1.8.1",
     "express": "^4.21.0",

@@ -1,16 +1,23 @@
 /**
- * File system HTTP API.
+ * File system HTTP API — backed by Upstash Redis.
  *
- * Maps Node.js fs operations to HTTP endpoints. The client-side shim
- * (client/shims/original-fs.js) translates fs calls into requests here.
+ * Maps Redis-backed virtual filesystem operations to HTTP endpoints.
+ * The client-side shim (shims/capacitor-shim.js) translates fs calls
+ * into requests here.
  *
- * All paths are relative to the configured vault root for safety.
+ * Redis data model:
+ *   vault:{vaultId}:tree       → Hash  — relPath → JSON stats
+ *   vault:{vaultId}:data:{path} → String — file content
+ *
+ * All paths are relative to the vault root for safety.
  */
 
 const express = require('express');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
+
+const { getRedis, treeKey, dataKey } = require('../redis');
 
 const {
   tryGetSystemFilePath,
@@ -28,143 +35,96 @@ function invalidateBootstrapCache(vaultId) {
   } catch (_) {}
 }
 
-// Async existence check used by the system-plugin overlay so we can give
-// the vault precedence over the repo copy.
-async function fileExists(absPath) {
-  try { await fsp.access(absPath); return true; } catch { return false; }
+// ── Redis helpers ──────────────────────────────────────────────────────────
+
+function nowMs() { return Date.now(); }
+
+function makeStats(relPath, isDir) {
+  const mtime = nowMs();
+  return {
+    isFile: !isDir,
+    isDirectory: isDir,
+    isSymbolicLink: false,
+    size: isDir ? 4096 : 0,
+    mtime,
+    ctime: mtime,
+    atime: mtime,
+    birthtime: mtime,
+    mode: isDir ? 0o040755 : 0o100644,
+  };
 }
 
-// Like fsp.readdir(target, { withFileTypes: true }) but returns [] when
-// the directory is missing (ENOENT/ENOTDIR). Other errors still throw.
-async function safeReaddir(absPath) {
-  try {
-    return await fsp.readdir(absPath, { withFileTypes: true });
-  } catch (err) {
-    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return [];
-    throw err;
+function parseStats(json) {
+  if (!json) return null;
+  try { return typeof json === 'string' ? JSON.parse(json) : json; } catch (_) { return null; }
+}
+
+function pathParent(relPath) {
+  const idx = relPath.lastIndexOf('/');
+  return idx > 0 ? relPath.substring(0, idx) : '';
+}
+
+function pathName(relPath) {
+  const idx = relPath.lastIndexOf('/');
+  return idx >= 0 ? relPath.substring(idx + 1) : relPath;
+}
+
+// Ensure every ancestor directory of relPath exists in the tree hash.
+async function ensureParentDirs(redis, tid, relPath) {
+  const parts = relPath.split('/');
+  parts.pop();
+  let dir = '';
+  const pipeline = redis.pipeline();
+  let dirty = false;
+  for (const part of parts) {
+    dir = dir ? dir + '/' + part : part;
+    pipeline.hexists(treeKey(tid), dir);
+    dirty = true;
   }
-}
+  if (!dirty) return;
+  const results = await pipeline.exec();
 
-// ── Write coalescing for rapid writes ──────────────────────────────────────
-// On slow filesystems (rclone FUSE) rapid writes to the same file pile up
-// and choke the mount.  This mechanism detects per-file write frequency:
-//
-//   First write to a file   → immediate (no delay)
-//   Second write within N ms → buffered; timer reset
-//   After N ms of quiet     → flush to disk
-//
-// Normal note saves go straight to disk.  Rapid-fire config writes
-// (workspace.json written 20x/min) coalesce into a single disk write.
-
-const COALESCE_WINDOW_MS = 5000; // writes within this window are coalesced
-
-// key = absolute path → { data, encoding, timer, mtime }
-const pendingWrites = new Map();
-// key = absolute path → timestamp of last completed write
-const lastWriteTime = new Map();
-
-function shouldCoalesce(absPath) {
-  const last = lastWriteTime.get(absPath);
-  return last && (Date.now() - last) < COALESCE_WINDOW_MS;
-}
-
-function scheduleFlush(absPath) {
-  const entry = pendingWrites.get(absPath);
-  if (!entry) return;
-  if (entry.timer) clearTimeout(entry.timer);
-  entry.timer = setTimeout(async () => {
-    const pending = pendingWrites.get(absPath);
-    if (!pending) return;
-    pendingWrites.delete(absPath);
-    try {
-      await fsp.writeFile(absPath, pending.data, pending.encoding ? { encoding: pending.encoding } : undefined);
-      lastWriteTime.set(absPath, Date.now());
-    } catch (err) {
-      console.error('[write-coalesce] flush failed:', absPath, err.message);
+  const pipe2 = redis.pipeline();
+  let i = 0;
+  dir = '';
+  for (const part of parts) {
+    dir = dir ? dir + '/' + part : part;
+    const exists = results[i] && results[i][1];
+    if (!exists) {
+      pipe2.hset(treeKey(tid), dir, JSON.stringify(makeStats(dir, true)));
     }
-  }, COALESCE_WINDOW_MS);
+    i++;
+  }
+  await pipe2.exec();
 }
 
-function getPendingContent(absPath) {
-  return pendingWrites.get(absPath) || null;
-}
-
-// Flush all pending writes on shutdown (async with timeout so slow
-// filesystems like rclone don't hang the process indefinitely).
-async function flushAllPending() {
-  const entries = [...pendingWrites.entries()];
-  pendingWrites.clear();
-  if (entries.length === 0) return;
-  console.log('[write-coalesce] flushing', entries.length, 'pending writes...');
-  const FLUSH_TIMEOUT = 10000;
-  const writes = entries.map(([absPath, entry]) => {
-    if (entry.timer) clearTimeout(entry.timer);
-    return fsp.writeFile(absPath, entry.data, entry.encoding ? { encoding: entry.encoding } : undefined)
-      .catch(err => console.error('[write-coalesce] flush failed:', absPath, err.message));
-  });
-  await Promise.race([
-    Promise.all(writes),
-    new Promise(resolve => setTimeout(() => {
-      console.warn('[write-coalesce] flush timeout — some writes may be lost');
-      resolve();
-    }, FLUSH_TIMEOUT)),
-  ]);
-}
-
-process.on('SIGTERM', () => flushAllPending().finally(() => process.exit(0)));
-process.on('SIGINT', () => flushAllPending().finally(() => process.exit(0)));
+// ── Router ─────────────────────────────────────────────────────────────────
 
 function createFsRouter(vaultRegistry, fallbackVaultRoot) {
   const router = express.Router();
+  const redis = getRedis();
 
-  function getVaultRoot(req) {
-    const vaultId = req.query.vault || (req.body && req.body.vault);
-    if (vaultId) {
-      const vault = vaultRegistry.get(vaultId);
-      if (!vault) {
-        const err = new Error('unknown vault: ' + vaultId);
-        err.code = 'ENOVAULT';
-        throw err;
-      }
-      return vault.path;
-    }
-    return fallbackVaultRoot;
+  function getVaultId(req) {
+    return req.query.vault || 'default';
   }
 
-  // Resolve a path relative to the vault root, ensuring it stays inside.
-  function resolveSafe(req, relPath) {
+  // Path safety: reject traversal
+  function safePath(relPath) {
     if (typeof relPath !== 'string') {
-      throw new Error('path must be a string');
+      const err = new Error('path must be a string');
+      err.code = 'ENOENT';
+      throw err;
     }
-    const vaultRoot = getVaultRoot(req);
-    const absolute = path.resolve(vaultRoot, '.' + path.sep + relPath);
-    const normalizedRoot = path.resolve(vaultRoot);
-    if (absolute !== normalizedRoot && !absolute.startsWith(normalizedRoot + path.sep)) {
-      throw new Error('path escapes vault root: ' + relPath);
+    const cleaned = relPath.replace(/^\/+/, '');
+    if (cleaned.includes('..')) {
+      const err = new Error('path escapes vault root: ' + relPath);
+      err.code = 'EACCES';
+      throw err;
     }
-    return absolute;
-  }
-
-  // Convert an fs.Stats object into a JSON-friendly form.
-  function serializeStats(stats) {
-    return {
-      isFile: stats.isFile(),
-      isDirectory: stats.isDirectory(),
-      isSymbolicLink: stats.isSymbolicLink(),
-      size: stats.size,
-      mtime: stats.mtime.getTime(),
-      ctime: stats.ctime.getTime(),
-      atime: stats.atime.getTime(),
-      birthtime: stats.birthtime.getTime(),
-      mode: stats.mode,
-    };
+    return cleaned;
   }
 
   function handleError(res, err) {
-    // ENOTDIR (readdir on a file) and EISDIR (read on a directory) are
-    // routine "wrong shape" errors that Obsidian handles via try/catch.
-    // We return 404 so the client-side fetch wrapper treats them like
-    // any other "not found" without alarming console errors.
     const status = err.code === 'ENOENT' ? 404
       : err.code === 'EACCES' ? 403
       : err.code === 'EISDIR' ? 404
@@ -177,79 +137,88 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
     });
   }
 
-  // Stat a single entry.
+  // ── GET /stat ────────────────────────────────────────────────────────────
+
   router.get('/stat', async (req, res) => {
     const relPath = req.query.path || '';
     const isPluginsDir = relPath === '.obsidian/plugins' || relPath === '.obsidian/plugins/';
+    const tid = getVaultId(req);
 
     try {
-      const target = resolveSafe(req, relPath);
-
-      // System plugin overlay: if this is a system plugin path AND not in
-      // the vault, stat the repo copy instead.
-      const systemPath = tryGetSystemFilePath(relPath);
-      if (systemPath) {
-        const vaultHas = await fileExists(target);
-        if (!vaultHas) {
-          const stats = await fsp.stat(systemPath);
-          return res.json(serializeStats(stats));
+      // System plugin overlay: if this is a system plugin file AND the vault
+      // doesn't have it, stat the repo copy instead.
+      if (relPath) {
+        const systemPath = tryGetSystemFilePath(relPath);
+        if (systemPath) {
+          const inRedis = await redis.hexists(treeKey(tid), relPath);
+          if (!inRedis) {
+            const stats = await fsp.stat(systemPath);
+            return res.json({
+              isFile: stats.isFile(),
+              isDirectory: stats.isDirectory(),
+              isSymbolicLink: false,
+              size: stats.size,
+              mtime: stats.mtime.getTime(),
+              ctime: stats.ctime.getTime(),
+              atime: stats.atime.getTime(),
+              birthtime: stats.birthtime.getTime(),
+              mode: stats.mode,
+            });
+          }
         }
       }
 
-      const pending = getPendingContent(target);
-      const stats = await fsp.stat(target);
-      // If there's a pending write, override mtime so the client sees fresh data.
-      if (pending) {
-        stats.mtime = new Date(pending.mtime);
-        stats.mtimeMs = pending.mtime;
+      // Empty path = vault root directory
+      if (!relPath) {
+        return res.json(makeStats('', true));
       }
-      res.json(serializeStats(stats));
+
+      const raw = await redis.hget(treeKey(tid), relPath);
+      if (raw) {
+        const s = parseStats(raw);
+        if (s) return res.json(s);
+      }
+
+      // Maybe it is a virtual directory (has children but no explicit entry)
+      const allKeys = await redis.hkeys(treeKey(tid));
+      const prefix = relPath + '/';
+      const hasChildren = allKeys.some(k => k.startsWith(prefix));
+      if (hasChildren) {
+        return res.json(makeStats(relPath, true));
+      }
+
+      throw Object.assign(new Error('not found: ' + relPath), { code: 'ENOENT' });
     } catch (err) {
-      // Synthesize a directory stat for .obsidian/plugins when the vault
-      // doesn't have it yet — otherwise Obsidian's plugin discovery aborts
-      // before it ever gets to readdir, and our system plugins stay hidden.
+      // Synthesize a directory stat for .obsidian/plugins when vault doesn't have it
       if ((err.code === 'ENOENT' || err.code === 'ENOTDIR')
           && isPluginsDir
           && getSystemPluginIds().length > 0) {
-        const now = Date.now();
+        const n = Date.now();
         return res.json({
-          isFile: false,
-          isDirectory: true,
-          isSymbolicLink: false,
-          size: 4096,
-          mtime: now,
-          ctime: now,
-          atime: now,
-          birthtime: now,
-          mode: 0o040755,
+          isFile: false, isDirectory: true, isSymbolicLink: false, size: 4096,
+          mtime: n, ctime: n, atime: n, birthtime: n, mode: 0o040755,
         });
       }
       handleError(res, err);
     }
   });
 
-  // List directory contents (with stats so the client can avoid extra round-trips).
+  // ── GET /readdir ─────────────────────────────────────────────────────────
+
   router.get('/readdir', async (req, res) => {
     const relPath = req.query.path || '';
     const isPluginsDir = relPath === '.obsidian/plugins' || relPath === '.obsidian/plugins/';
-    // Match exactly .obsidian/plugins/<id> (no trailing path); optional trailing slash.
     const inSysDirMatch = relPath.match(/^\.obsidian\/plugins\/([^/]+)\/?$/);
     const inSysDir = inSysDirMatch && getSystemPluginIds().includes(inSysDirMatch[1]);
+    const tid = getVaultId(req);
 
     try {
-      const target = resolveSafe(req, relPath);
-      // Helpful debug: log the resolved absolute path when readdir is called.
-      // Useful for tracking down "readdir on a file" mysteries.
-      if (process.env.OW_DEBUG) {
-        console.log('[readdir]', relPath, '->', target);
-      }
-
-      // Inside a system plugin dir? If the vault doesn't have its own copy,
-      // list from the repo. (If the vault DOES override it, fall through to
-      // the normal readdir on the vault copy.)
+      // Inside a system plugin dir: if vault has no entries, list from repo
       if (inSysDir) {
-        const vaultEntries = await safeReaddir(target);
-        if (vaultEntries.length === 0) {
+        const allKeys = await redis.hkeys(treeKey(tid));
+        const sysPrefix = relPath + '/';
+        const vaultHasEntries = allKeys.some(k => k.startsWith(sysPrefix));
+        if (!vaultHasEntries) {
           const repoDir = getSystemPluginDir(inSysDirMatch[1]);
           const entries = await fsp.readdir(repoDir, { withFileTypes: true });
           const result = await Promise.all(entries.map(async (entry) => {
@@ -257,8 +226,12 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
             let stats = null;
             try {
               const s = await fsp.stat(child);
-              stats = serializeStats(s);
-            } catch (_) { /* ignore */ }
+              stats = {
+                isFile: s.isFile(), isDirectory: s.isDirectory(), isSymbolicLink: false,
+                size: s.size, mtime: s.mtime.getTime(), ctime: s.ctime.getTime(),
+                atime: s.atime.getTime(), birthtime: s.birthtime.getTime(), mode: s.mode,
+              };
+            } catch (_) {}
             return {
               name: entry.name,
               isFile: entry.isFile(),
@@ -271,30 +244,73 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         }
       }
 
-      const entries = await fsp.readdir(target, { withFileTypes: true });
-      const result = await Promise.all(entries.map(async (entry) => {
-        const child = path.join(target, entry.name);
-        let stats = null;
-        try {
-          const s = await fsp.stat(child);
-          stats = serializeStats(s);
-        } catch (_) {
-          // Broken symlink or permission issue: still return the name.
+      // Redis readdir: get all keys, filter to direct children of relPath
+      const prefix = relPath ? relPath + '/' : '';
+      const allKeys = await redis.hkeys(treeKey(tid));
+      const childMap = new Map();
+
+      for (const key of allKeys) {
+        if (prefix && !key.startsWith(prefix)) continue;
+        if (!prefix && key.indexOf('/') !== -1) continue; // root: skip nested
+
+        const rest = prefix ? key.slice(prefix.length) : key;
+        if (!rest) continue;
+
+        const slashIdx = rest.indexOf('/');
+        if (slashIdx !== -1) {
+          // This is a child directory
+          const dirName = rest.substring(0, slashIdx);
+          if (!childMap.has(dirName)) {
+            childMap.set(dirName, {
+              name: dirName,
+              isFile: false,
+              isDirectory: true,
+              isSymbolicLink: false,
+              stats: null,
+            });
+          }
+        } else {
+          // Direct child — file
+          if (!childMap.has(rest)) {
+            const raw = await redis.hget(treeKey(tid), key);
+            const s = parseStats(raw);
+            childMap.set(rest, {
+              name: rest,
+              isFile: s ? s.isFile : true,
+              isDirectory: s ? s.isDirectory : false,
+              isSymbolicLink: false,
+              stats: s ? {
+                isFile: s.isFile, isDirectory: s.isDirectory, isSymbolicLink: false,
+                size: s.size, mtime: s.mtime, ctime: s.ctime,
+                atime: s.atime, birthtime: s.birthtime, mode: s.mode,
+              } : null,
+            });
+          }
         }
-        return {
-          name: entry.name,
-          isFile: entry.isFile(),
-          isDirectory: entry.isDirectory(),
-          isSymbolicLink: entry.isSymbolicLink(),
-          stats,
-        };
-      }));
+      }
+
+      // Fill in stats for virtual directories
+      for (const [name, entry] of childMap) {
+        if (entry.isDirectory && !entry.stats) {
+          const dirPath = prefix + name;
+          const raw = await redis.hget(treeKey(tid), dirPath);
+          const s = parseStats(raw);
+          if (s) {
+            entry.stats = {
+              isFile: s.isFile, isDirectory: s.isDirectory, isSymbolicLink: false,
+              size: s.size, mtime: s.mtime, ctime: s.ctime,
+              atime: s.atime, birthtime: s.birthtime, mode: s.mode,
+            };
+          }
+        }
+      }
+
+      const result = Array.from(childMap.values());
 
       // If listing .obsidian/plugins, merge in system plugin directory entries
-      // for ids the vault doesn't already have.
       if (isPluginsDir) {
         for (const id of getSystemPluginIds()) {
-          if (!result.find((e) => e.name === id)) {
+          if (!result.find(e => e.name === id)) {
             result.push({
               name: id,
               isFile: false,
@@ -308,13 +324,11 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
 
       res.json(result);
     } catch (err) {
-      // Synthesize a listing for .obsidian/plugins when the vault doesn't
-      // have that directory yet — Obsidian creates it lazily, but we want
-      // our system plugins to show up immediately.
+      // Synthesize listing for .obsidian/plugins when vault doesn't have it
       if ((err.code === 'ENOENT' || err.code === 'ENOTDIR')
           && isPluginsDir
           && getSystemPluginIds().length > 0) {
-        return res.json(getSystemPluginIds().map((id) => ({
+        return res.json(getSystemPluginIds().map(id => ({
           name: id,
           isFile: false,
           isDirectory: true,
@@ -326,34 +340,25 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
     }
   });
 
-  // Read a file (text or binary depending on ?encoding).
+  // ── GET /read ────────────────────────────────────────────────────────────
+
   router.get('/read', async (req, res) => {
+    const tid = getVaultId(req);
     try {
       const relPath = req.query.path || '';
-      const target = resolveSafe(req, relPath);
       const encoding = req.query.encoding || null;
 
-      // Special case: community-plugins.json — merge system ids into the
-      // list Obsidian sees, regardless of whether the vault file exists.
+      // Special case: community-plugins.json — merge system ids
       if (relPath === '.obsidian/community-plugins.json') {
         let list = [];
-        const pending = getPendingContent(target);
-        if (pending) {
-          // Pending write — parse the buffered content.
-          try {
-            const txt = typeof pending.data === 'string' ? pending.data : pending.data.toString('utf8');
+        try {
+          const raw = await redis.get(dataKey(tid, relPath));
+          if (raw) {
+            const txt = typeof raw === 'string' ? raw : raw.toString('utf8');
             const parsed = JSON.parse(txt);
             if (Array.isArray(parsed)) list = parsed;
-          } catch (_) { /* malformed: start from empty */ }
-        } else {
-          try {
-            const txt = await fsp.readFile(target, 'utf8');
-            const parsed = JSON.parse(txt);
-            if (Array.isArray(parsed)) list = parsed;
-          } catch (err) {
-            if (err.code !== 'ENOENT') throw err;
           }
-        }
+        } catch (_) {}
         const merged = mergeCommunityList(list);
         if (encoding) {
           return res.type('text/plain; charset=utf-8').send(JSON.stringify(merged));
@@ -361,12 +366,12 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         return res.type('application/json').send(JSON.stringify(merged));
       }
 
-      // System plugin overlay: if this is a system plugin file AND the
-      // vault doesn't have it, serve from <repo>/plugins/.
+      // System plugin overlay: if this is a system plugin file AND the vault
+      // doesn't have it, serve from <repo>/plugins/.
       const systemPath = tryGetSystemFilePath(relPath);
       if (systemPath) {
-        const vaultHas = await fileExists(target);
-        if (!vaultHas) {
+        const inRedis = await redis.hexists(treeKey(tid), relPath);
+        if (!inRedis) {
           if (encoding) {
             const data = await fsp.readFile(systemPath, encoding);
             return res.type('text/plain; charset=utf-8').send(data);
@@ -376,127 +381,196 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         }
       }
 
-      // Serve from debounce buffer if a write is pending.
-      const pending = getPendingContent(target);
-      if (pending) {
-        if (encoding) {
-          res.type('text/plain; charset=utf-8').send(typeof pending.data === 'string' ? pending.data : pending.data.toString(encoding));
-        } else {
-          res.type('application/octet-stream').send(pending.data);
-        }
-        return;
+      const content = await redis.get(dataKey(tid, relPath));
+      if (content === null || content === undefined) {
+        throw Object.assign(new Error('ENOENT: ' + relPath), { code: 'ENOENT' });
       }
       if (encoding) {
-        const data = await fsp.readFile(target, encoding);
-        res.type('text/plain; charset=utf-8').send(data);
+        res.type('text/plain; charset=utf-8').send(
+          typeof content === 'string' ? content : content.toString(encoding),
+        );
       } else {
-        const data = await fsp.readFile(target);
-        res.type('application/octet-stream').send(data);
+        res.type('application/octet-stream').send(
+          typeof content === 'string' ? Buffer.from(content) : content,
+        );
       }
     } catch (err) {
       handleError(res, err);
     }
   });
 
-  // Write a file. Body is the raw content (text or binary).
-  // ?encoding=utf8 means the server treats body as utf-8 text.
+  // ── PUT /write ───────────────────────────────────────────────────────────
+
   router.put('/write', express.raw({ type: '*/*', limit: '256mb' }), async (req, res) => {
+    const tid = getVaultId(req);
     try {
       const relPath = req.query.path || '';
-      const target = resolveSafe(req, relPath);
+      const safe = safePath(relPath);
       const encoding = req.query.encoding || null;
       let data = encoding ? req.body.toString(encoding) : req.body;
 
-      // For community-plugins.json: strip our system plugin ids before
-      // writing so we don't pollute the user's vault. Malformed JSON is
-      // passed through untouched.
-      if (relPath === '.obsidian/community-plugins.json' && encoding) {
+      // For community-plugins.json: strip system plugin ids before writing
+      if (safe === '.obsidian/community-plugins.json' && encoding) {
         try {
           const parsed = JSON.parse(data);
           if (Array.isArray(parsed)) {
             const cleaned = stripCommunityList(parsed);
             data = JSON.stringify(cleaned, null, 2);
           }
-        } catch (_) { /* malformed JSON: pass through as-is */ }
+        } catch (_) {}
       }
 
-      await fsp.mkdir(path.dirname(target), { recursive: true });
+      const contentStr = encoding
+        ? data
+        : (Buffer.isBuffer(data) ? data.toString('base64') : String(data));
+      const stats = makeStats(safe, false);
+      stats.size = encoding
+        ? Buffer.byteLength(data, 'utf8')
+        : (Buffer.isBuffer(data) ? data.length : 0);
 
-      // If this file was written recently, coalesce instead of hitting disk.
-      if (shouldCoalesce(target)) {
-        pendingWrites.set(target, { data, encoding, timer: null, mtime: Date.now() });
-        scheduleFlush(target);
-        invalidateBootstrapCache(req.query.vault);
-        res.json({ ok: true });
-        return;
-      }
+      const pipe = redis.pipeline();
+      pipe.set(dataKey(tid, safe), contentStr);
+      pipe.hset(treeKey(tid), safe, JSON.stringify(stats));
+      await pipe.exec();
 
-      await fsp.writeFile(target, data, encoding ? { encoding } : undefined);
-      lastWriteTime.set(target, Date.now());
-      invalidateBootstrapCache(req.query.vault);
+      await ensureParentDirs(redis, tid, safe);
+      invalidateBootstrapCache(tid);
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
   });
+
+  // ── POST /mkdir ──────────────────────────────────────────────────────────
 
   router.post('/mkdir', express.json(), async (req, res) => {
+    const tid = getVaultId(req);
     try {
-      const target = resolveSafe(req, req.body.path || '');
-      const recursive = req.body.recursive !== false;
-      await fsp.mkdir(target, { recursive });
-      invalidateBootstrapCache(req.body.vault);
+      const safe = safePath(req.body.path || '');
+      const stats = makeStats(safe, true);
+      await redis.hset(treeKey(tid), safe, JSON.stringify(stats));
+      await ensureParentDirs(redis, tid, safe);
+      invalidateBootstrapCache(tid);
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
   });
+
+  // ── DELETE /unlink ───────────────────────────────────────────────────────
 
   router.delete('/unlink', async (req, res) => {
+    const tid = getVaultId(req);
     try {
-      const target = resolveSafe(req, req.query.path || '');
-      await fsp.unlink(target);
-      invalidateBootstrapCache(req.query.vault);
+      const safe = safePath(req.query.path || '');
+      const pipe = redis.pipeline();
+      pipe.del(dataKey(tid, safe));
+      pipe.hdel(treeKey(tid), safe);
+      await pipe.exec();
+      invalidateBootstrapCache(tid);
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
   });
+
+  // ── DELETE /rmdir ────────────────────────────────────────────────────────
 
   router.delete('/rmdir', async (req, res) => {
+    const tid = getVaultId(req);
     try {
-      const target = resolveSafe(req, req.query.path || '');
+      const safe = safePath(req.query.path || '');
       const recursive = req.query.recursive === '1';
-      if (recursive) {
-        await fsp.rm(target, { recursive: true, force: false });
-      } else {
-        await fsp.rmdir(target);
+      const prefix = safe + '/';
+      const allKeys = await redis.hkeys(treeKey(tid));
+      const toDelete = allKeys.filter(k => k === safe || k.startsWith(prefix));
+
+      if (!recursive && toDelete.length > 1) {
+        const err = new Error('directory not empty');
+        err.code = 'ENOTEMPTY';
+        throw err;
       }
-      invalidateBootstrapCache(req.query.vault);
+
+      const pipe = redis.pipeline();
+      for (const key of toDelete) {
+        pipe.hdel(treeKey(tid), key);
+        pipe.del(dataKey(tid, key));
+      }
+      await pipe.exec();
+      invalidateBootstrapCache(tid);
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
   });
+
+  // ── POST /rename ─────────────────────────────────────────────────────────
 
   router.post('/rename', express.json(), async (req, res) => {
+    const tid = getVaultId(req);
     try {
-      const oldPath = resolveSafe(req, req.body.oldPath || '');
-      const newPath = resolveSafe(req, req.body.newPath || '');
-      await fsp.rename(oldPath, newPath);
-      invalidateBootstrapCache(req.body.vault);
+      const oldPath = safePath(req.body.oldPath || '');
+      const newPath = safePath(req.body.newPath || '');
+
+      const allKeys = await redis.hkeys(treeKey(tid));
+      const prefix = oldPath + '/';
+      const affected = allKeys.filter(k => k === oldPath || k.startsWith(prefix));
+
+      // Read all affected entries first, then write/delete in one pipeline
+      const entries = [];
+      for (const key of affected) {
+        const newKey = newPath + key.slice(oldPath.length);
+        const stats = await redis.hget(treeKey(tid), key);
+        const data = await redis.get(dataKey(tid, key));
+        entries.push({ key, newKey, stats, data });
+      }
+
+      const pipe = redis.pipeline();
+      for (const { key, newKey, stats, data } of entries) {
+        if (stats) pipe.hset(treeKey(tid), newKey, stats);
+        pipe.hdel(treeKey(tid), key);
+        if (data !== null && data !== undefined) {
+          pipe.set(dataKey(tid, newKey), data);
+        }
+        pipe.del(dataKey(tid), key);
+      }
+      await pipe.exec();
+      invalidateBootstrapCache(tid);
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
   });
 
+  // ── POST /copy ───────────────────────────────────────────────────────────
+
   router.post('/copy', express.json(), async (req, res) => {
+    const tid = getVaultId(req);
     try {
-      const src = resolveSafe(req, req.body.src || '');
-      const dest = resolveSafe(req, req.body.dest || '');
-      await fsp.copyFile(src, dest);
-      invalidateBootstrapCache(req.body.vault);
+      const src = safePath(req.body.src || '');
+      const dest = safePath(req.body.dest || '');
+
+      const allKeys = await redis.hkeys(treeKey(tid));
+      const prefix = src + '/';
+      const affected = allKeys.filter(k => k === src || k.startsWith(prefix));
+
+      const entries = [];
+      for (const key of affected) {
+        const newKey = dest + key.slice(src.length);
+        const stats = await redis.hget(treeKey(tid), key);
+        const data = await redis.get(dataKey(tid, key));
+        entries.push({ newKey, stats, data });
+      }
+
+      const pipe = redis.pipeline();
+      for (const { newKey, stats, data } of entries) {
+        if (stats) pipe.hset(treeKey(tid), newKey, stats);
+        if (data !== null && data !== undefined) {
+          pipe.set(dataKey(tid, newKey), data);
+        }
+      }
+      await pipe.exec();
+      invalidateBootstrapCache(tid);
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
