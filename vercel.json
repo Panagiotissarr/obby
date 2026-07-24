@@ -1,9 +1,19 @@
 {
   "version": 2,
+  "installCommand": "npm install && node scripts/update-obsidian-mobile.js && cd src/runtime-server/server && npm install",
+  "buildCommand": "echo 'build already done in installCommand'",
   "builds": [
     {
       "src": "src/runtime-server/server/index.js",
-      "use": "@vercel/node"
+      "use": "@vercel/node",
+      "config": {
+        "includeFiles": [
+          "vendor/**",
+          "src/client-mobile/**",
+          "src/plugins/**",
+          "src/config/**"
+        ]
+      }
     }
   ],
   "routes": [
