@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "outputDirectory": ".",
   "buildCommand": "npm run vercel-build",
   "functions": {
     "api/index.js": {
