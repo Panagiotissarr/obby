@@ -1087,6 +1087,50 @@ const MOBILE_SCRIPTS = [
           });
         }
 
+        // ── General sidebar context menu (New note / New folder menu) ─────
+        // Injects Save & Sync items into any .menu that opens via right-click.
+        // Uses a contextmenu listener + short delay so the menu has time to render.
+        function injectSidebarContextMenuItems() {
+          document.addEventListener('contextmenu', function () {
+            setTimeout(function () {
+              var menu = document.querySelector('.menu');
+              if (!menu || menu.querySelector('.ow-redis-menu-item')) return;
+
+              // Only inject if the menu looks like the file-explorer sidebar menu
+              // (contains "new-note" or "new-file" items) — avoid polluting
+              // random Obsidian menus (editor context menu, etc.).
+              var hasNewNote = menu.querySelector('[id*="new-note"], [data-id*="new-note"]')
+                || menu.querySelector('.menu-item-label')
+                && /new note|new file|create note/i.test(menu.textContent);
+              if (!hasNewNote) return;
+
+              var sep = document.createElement('div');
+              sep.className = 'menu-separator';
+              menu.appendChild(sep);
+
+              var saveItem = document.createElement('div');
+              saveItem.className = 'menu-item ow-redis-menu-item';
+              saveItem.innerHTML = '<div class="menu-item-label">Save vault to Redis</div>';
+              saveItem.addEventListener('click', function (e) {
+                e.stopPropagation();
+                menu.style.display = 'none';
+                doSave();
+              });
+              menu.appendChild(saveItem);
+
+              var syncItem = document.createElement('div');
+              syncItem.className = 'menu-item ow-redis-menu-item';
+              syncItem.innerHTML = '<div class="menu-item-label">Sync vault from Redis</div>';
+              syncItem.addEventListener('click', function (e) {
+                e.stopPropagation();
+                menu.style.display = 'none';
+                doRefresh();
+              });
+              menu.appendChild(syncItem);
+            }, 80);
+          });
+        }
+
         // Context menu: register via Obsidian's workspace event
         owWhenAppReady(function (app) {
           if (app.workspace && typeof app.workspace.on === 'function') {
@@ -1100,6 +1144,7 @@ const MOBILE_SCRIPTS = [
               });
             });
           }
+          injectSidebarContextMenuItems();
         });
 
         // Toolbar buttons in file explorer (same pattern as folder-refresh)
