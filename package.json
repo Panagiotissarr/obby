@@ -4,7 +4,7 @@
   "private": true,
   "description": "Obsidian renderer in the browser via Redis-backed serverless functions",
   "scripts": {
-    "vercel-build": "node scripts/update-obsidian-mobile.js && node scripts/patch-obsidian-mobile.js && cd src/runtime-server/server && npm install",
+    "vercel-build": "node scripts/update-obsidian-mobile.js && cd src/runtime-server/server && npm install",
     "start": "cd src/runtime-server/server && npm start",
     "dev": "cd src/runtime-server/server && npm run dev"
   }
