@@ -382,7 +382,10 @@
 
       if (window.__owBootstrapLookup) {
         const hit = window.__owBootstrapLookup.lookupDir(window.__owBootstrapCache, p);
-        if (hit) return { files: hit };
+        if (hit && hit.length > 0) return { files: hit };
+        if (hit && hit.length === 0) {
+          console.debug('[capacitor-shim] readdir bootstrap cache returned empty for:', p);
+        }
       }
 
       const res = await fetch('/api/fs/readdir?' + vaultQuery() + 'path=' + encodePath(p));
