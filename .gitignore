@@ -35,3 +35,9 @@ docs-private/
 # §3א) — generated + removed by build-assets.sh, safety net in case a build
 # is interrupted mid-way.
 src/deployments/cloudflare/plugins-generated.js
+
+Time-Garden/
+Time-Garden
+
+# User vault folder
+myvault/

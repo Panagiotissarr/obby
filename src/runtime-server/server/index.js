@@ -211,6 +211,18 @@ function startServer(appConfig = config) {
   const server = http.createServer(app);
   attachWatchServer(server, app.locals.vaultRegistry, appConfig.vaultPath);
 
+  // Register the configured vault path in the registry so it appears in
+  // /api/vaults/list and /api/vaults/redis (filesystem fallback).
+  try {
+    const registry = app.locals.vaultRegistry;
+    const result = registry.open(appConfig.vaultPath, false);
+    if (result.ok) {
+      console.log('[vault] registered: id=' + result.id + ' path=' + appConfig.vaultPath);
+    }
+  } catch (e) {
+    console.warn('[vault] could not register vault path:', e.message);
+  }
+
   server.listen(appConfig.port, appConfig.host, () => {
     console.log('==========================================');
     console.log('  Obsidian Web');

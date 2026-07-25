@@ -1,15 +1,12 @@
 /**
- * File system HTTP API — backed by Upstash Redis.
+ * File system HTTP API — backed by Upstash Redis with filesystem fallback.
  *
- * Maps Redis-backed virtual filesystem operations to HTTP endpoints.
- * The client-side shim (shims/capacitor-shim.js) translates fs calls
- * into requests here.
+ * When Redis is unavailable (KV_REST_API_URL not set), falls back to serving
+ * files from the filesystem at vaultRegistry/<vault-id> path or fallbackVaultRoot.
  *
  * Redis data model:
  *   vault:{vaultId}:tree       → Hash  — relPath → JSON stats
  *   vault:{vaultId}:data:{path} → String — file content
- *
- * All paths are relative to the vault root for safety.
  */
 
 const express = require('express');
@@ -27,15 +24,12 @@ const {
   stripCommunityList,
 } = require('../system-plugins');
 
-// Imported lazily to avoid circular require — bootstrap.js exports serverCache.
 function invalidateBootstrapCache(vaultId) {
   try {
     const { serverCache } = require('./bootstrap');
     if (serverCache) serverCache.delete(vaultId);
   } catch (_) {}
 }
-
-// ── Redis helpers ──────────────────────────────────────────────────────────
 
 function nowMs() { return Date.now(); }
 
@@ -59,6 +53,20 @@ function parseStats(json) {
   try { return typeof json === 'string' ? JSON.parse(json) : json; } catch (_) { return null; }
 }
 
+function makeFsStats(s) {
+  return {
+    isFile: s.isFile(),
+    isDirectory: s.isDirectory(),
+    isSymbolicLink: s.isSymbolicLink(),
+    size: s.size,
+    mtime: s.mtimeMs,
+    ctime: s.ctimeMs,
+    atime: s.atimeMs,
+    birthtime: s.birthtimeMs,
+    mode: s.mode,
+  };
+}
+
 function pathParent(relPath) {
   const idx = relPath.lastIndexOf('/');
   return idx > 0 ? relPath.substring(0, idx) : '';
@@ -69,7 +77,6 @@ function pathName(relPath) {
   return idx >= 0 ? relPath.substring(idx + 1) : relPath;
 }
 
-// Ensure every ancestor directory of relPath exists in the tree hash.
 async function ensureParentDirs(redis, tid, relPath) {
   const parts = relPath.split('/');
   parts.pop();
@@ -98,13 +105,16 @@ async function ensureParentDirs(redis, tid, relPath) {
   await pipe2.exec();
 }
 
-// ── Router ─────────────────────────────────────────────────────────────────
-
 function createFsRouter(vaultRegistry, fallbackVaultRoot) {
   const router = express.Router();
   var _redis = null;
+  var _redisErr = null;
   function redis() {
-    if (!_redis) _redis = getRedis();
+    if (_redisErr) return null;
+    if (!_redis) {
+      try { _redis = getRedis(); }
+      catch (e) { _redisErr = e; return null; }
+    }
     return _redis;
   }
 
@@ -112,7 +122,12 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
     return req.query.vault || 'default';
   }
 
-  // Path safety: reject traversal
+  function getVaultRoot(tid) {
+    var entry = vaultRegistry && vaultRegistry.get(tid);
+    if (entry && entry.path) return entry.path;
+    return fallbackVaultRoot;
+  }
+
   function safePath(relPath) {
     if (typeof relPath !== 'string') {
       const err = new Error('path must be a string');
@@ -141,21 +156,23 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
     });
   }
 
-  // ── GET /stat ────────────────────────────────────────────────────────────
-
   router.get('/stat', async (req, res) => {
     const relPath = req.query.path || '';
     const isPluginsDir = relPath === '.obsidian/plugins' || relPath === '.obsidian/plugins/';
     const tid = getVaultId(req);
+    const r = redis();
 
     try {
-      // System plugin overlay: if this is a system plugin file AND the vault
-      // doesn't have it, stat the repo copy instead.
       if (relPath) {
         const systemPath = tryGetSystemFilePath(relPath);
         if (systemPath) {
-          const inRedis = await redis().hexists(treeKey(tid), relPath);
-          if (!inRedis) {
+          var exists = false;
+          if (r) {
+            exists = await r.hexists(treeKey(tid), relPath);
+          } else {
+            try { await fsp.stat(path.join(getVaultRoot(tid), relPath)); exists = true; } catch (_) {}
+          }
+          if (!exists) {
             const stats = await fsp.stat(systemPath);
             return res.json({
               isFile: stats.isFile(),
@@ -172,28 +189,31 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         }
       }
 
-      // Empty path = vault root directory
       if (!relPath) {
         return res.json(makeStats('', true));
       }
 
-      const raw = await redis().hget(treeKey(tid), relPath);
-      if (raw) {
-        const s = parseStats(raw);
-        if (s) return res.json(s);
-      }
-
-      // Maybe it is a virtual directory (has children but no explicit entry)
-      const allKeys = await redis().hkeys(treeKey(tid));
-      const prefix = relPath + '/';
-      const hasChildren = allKeys.some(k => k.startsWith(prefix));
-      if (hasChildren) {
-        return res.json(makeStats(relPath, true));
+      if (r) {
+        const raw = await r.hget(treeKey(tid), relPath);
+        if (raw) {
+          const s = parseStats(raw);
+          if (s) return res.json(s);
+        }
+        const allKeys = await r.hkeys(treeKey(tid));
+        const prefix = relPath + '/';
+        const hasChildren = allKeys.some(k => k.startsWith(prefix));
+        if (hasChildren) {
+          return res.json(makeStats(relPath, true));
+        }
+      } else {
+        var root = getVaultRoot(tid);
+        var fullPath = path.join(root, relPath);
+        var s = await fsp.stat(fullPath);
+        return res.json(makeFsStats(s));
       }
 
       throw Object.assign(new Error('not found: ' + relPath), { code: 'ENOENT' });
     } catch (err) {
-      // Synthesize a directory stat for .obsidian/plugins when vault doesn't have it
       if ((err.code === 'ENOENT' || err.code === 'ENOTDIR')
           && isPluginsDir
           && getSystemPluginIds().length > 0) {
@@ -207,374 +227,339 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
     }
   });
 
-  // ── GET /readdir ─────────────────────────────────────────────────────────
-
   router.get('/readdir', async (req, res) => {
     const relPath = req.query.path || '';
     const isPluginsDir = relPath === '.obsidian/plugins' || relPath === '.obsidian/plugins/';
     const inSysDirMatch = relPath.match(/^\.obsidian\/plugins\/([^/]+)\/?$/);
     const inSysDir = inSysDirMatch && getSystemPluginIds().includes(inSysDirMatch[1]);
     const tid = getVaultId(req);
+    const r = redis();
 
     try {
-      // Inside a system plugin dir: if vault has no entries, list from repo
       if (inSysDir) {
-        const allKeys = await redis().hkeys(treeKey(tid));
-        const sysPrefix = relPath + '/';
-        const vaultHasEntries = allKeys.some(k => k.startsWith(sysPrefix));
-        if (!vaultHasEntries) {
-          const repoDir = getSystemPluginDir(inSysDirMatch[1]);
-          const entries = await fsp.readdir(repoDir, { withFileTypes: true });
-          const result = await Promise.all(entries.map(async (entry) => {
-            const child = path.join(repoDir, entry.name);
-            let stats = null;
-            try {
-              const s = await fsp.stat(child);
-              stats = {
-                isFile: s.isFile(), isDirectory: s.isDirectory(), isSymbolicLink: false,
-                size: s.size, mtime: s.mtime.getTime(), ctime: s.ctime.getTime(),
-                atime: s.atime.getTime(), birthtime: s.birthtime.getTime(), mode: s.mode,
-              };
-            } catch (_) {}
-            return {
-              name: entry.name,
-              isFile: entry.isFile(),
-              isDirectory: entry.isDirectory(),
-              isSymbolicLink: entry.isSymbolicLink(),
-              stats,
-            };
-          }));
-          return res.json(result);
-        }
+        var repoDir = getSystemPluginDir(inSysDirMatch[1]);
+        var entries = await fsp.readdir(repoDir, { withFileTypes: true });
+        var result = await Promise.all(entries.map(async (entry) => {
+          var child = path.join(repoDir, entry.name);
+          var st = null;
+          try { var ss = await fsp.stat(child); st = { isFile: ss.isFile(), isDirectory: ss.isDirectory(), isSymbolicLink: false, size: ss.size, mtime: ss.mtime.getTime(), ctime: ss.ctime.getTime(), atime: ss.atime.getTime(), birthtime: ss.birthtime.getTime(), mode: ss.mode }; } catch (_) {}
+          return { name: entry.name, isFile: entry.isFile(), isDirectory: entry.isDirectory(), isSymbolicLink: entry.isSymbolicLink(), stats: st };
+        }));
+        return res.json(result);
       }
 
-      // Redis readdir: get all keys, filter to direct children of relPath
+      if (!r) {
+        var root = getVaultRoot(tid);
+        var absPath = path.join(root, relPath);
+        var dirs = await fsp.readdir(absPath, { withFileTypes: true });
+        var list = await Promise.all(dirs.map(async function (d) {
+          var child = path.join(absPath, d.name);
+          var st = null;
+          try { st = makeFsStats(await fsp.stat(child)); } catch (_) {}
+          return { name: d.name, isFile: d.isFile(), isDirectory: d.isDirectory(), isSymbolicLink: d.isSymbolicLink(), stats: st };
+        }));
+        if (isPluginsDir) {
+          for (const id of getSystemPluginIds()) {
+            if (!list.find(e => e.name === id)) {
+              list.push({ name: id, isFile: false, isDirectory: true, isSymbolicLink: false, stats: null });
+            }
+          }
+        }
+        return res.json(list);
+      }
+
       const prefix = relPath ? relPath + '/' : '';
-      const allKeys = await redis().hkeys(treeKey(tid));
+      const allKeys = await r.hkeys(treeKey(tid));
       const childMap = new Map();
 
       for (const key of allKeys) {
         if (prefix && !key.startsWith(prefix)) continue;
-        if (!prefix && key.indexOf('/') !== -1) continue; // root: skip nested
-
+        if (!prefix && key.indexOf('/') !== -1) continue;
         const rest = prefix ? key.slice(prefix.length) : key;
         if (!rest) continue;
-
         const slashIdx = rest.indexOf('/');
         if (slashIdx !== -1) {
-          // This is a child directory
           const dirName = rest.substring(0, slashIdx);
           if (!childMap.has(dirName)) {
-            childMap.set(dirName, {
-              name: dirName,
-              isFile: false,
-              isDirectory: true,
-              isSymbolicLink: false,
-              stats: null,
-            });
+            childMap.set(dirName, { name: dirName, isFile: false, isDirectory: true, isSymbolicLink: false, stats: null });
           }
         } else {
-          // Direct child — file
           if (!childMap.has(rest)) {
-            const raw = await redis().hget(treeKey(tid), key);
+            const raw = await r.hget(treeKey(tid), key);
             const s = parseStats(raw);
             childMap.set(rest, {
               name: rest,
               isFile: s ? s.isFile : true,
               isDirectory: s ? s.isDirectory : false,
               isSymbolicLink: false,
-              stats: s ? {
-                isFile: s.isFile, isDirectory: s.isDirectory, isSymbolicLink: false,
-                size: s.size, mtime: s.mtime, ctime: s.ctime,
-                atime: s.atime, birthtime: s.birthtime, mode: s.mode,
-              } : null,
+              stats: s ? { isFile: s.isFile, isDirectory: s.isDirectory, isSymbolicLink: false, size: s.size, mtime: s.mtime, ctime: s.ctime, atime: s.atime, birthtime: s.birthtime, mode: s.mode } : null,
             });
           }
         }
       }
 
-      // Fill in stats for virtual directories
       for (const [name, entry] of childMap) {
         if (entry.isDirectory && !entry.stats) {
           const dirPath = prefix + name;
-          const raw = await redis().hget(treeKey(tid), dirPath);
+          const raw = await r.hget(treeKey(tid), dirPath);
           const s = parseStats(raw);
-          if (s) {
-            entry.stats = {
-              isFile: s.isFile, isDirectory: s.isDirectory, isSymbolicLink: false,
-              size: s.size, mtime: s.mtime, ctime: s.ctime,
-              atime: s.atime, birthtime: s.birthtime, mode: s.mode,
-            };
-          }
+          if (s) { entry.stats = { isFile: s.isFile, isDirectory: s.isDirectory, isSymbolicLink: false, size: s.size, mtime: s.mtime, ctime: s.ctime, atime: s.atime, birthtime: s.birthtime, mode: s.mode }; }
         }
       }
 
-      const result = Array.from(childMap.values());
-
-      // If listing .obsidian/plugins, merge in system plugin directory entries
+      var result = Array.from(childMap.values());
       if (isPluginsDir) {
         for (const id of getSystemPluginIds()) {
           if (!result.find(e => e.name === id)) {
-            result.push({
-              name: id,
-              isFile: false,
-              isDirectory: true,
-              isSymbolicLink: false,
-              stats: null,
-            });
+            result.push({ name: id, isFile: false, isDirectory: true, isSymbolicLink: false, stats: null });
           }
         }
       }
-
       res.json(result);
     } catch (err) {
-      // Synthesize listing for .obsidian/plugins when vault doesn't have it
       if ((err.code === 'ENOENT' || err.code === 'ENOTDIR')
           && isPluginsDir
           && getSystemPluginIds().length > 0) {
-        return res.json(getSystemPluginIds().map(id => ({
-          name: id,
-          isFile: false,
-          isDirectory: true,
-          isSymbolicLink: false,
-          stats: null,
-        })));
+        return res.json(getSystemPluginIds().map(id => ({ name: id, isFile: false, isDirectory: true, isSymbolicLink: false, stats: null })));
       }
       handleError(res, err);
     }
   });
 
-  // ── GET /read ────────────────────────────────────────────────────────────
-
   router.get('/read', async (req, res) => {
     const tid = getVaultId(req);
+    const r = redis();
     try {
       const relPath = req.query.path || '';
       const encoding = req.query.encoding || null;
 
-      // Special case: community-plugins.json — merge system ids
       if (relPath === '.obsidian/community-plugins.json') {
         let list = [];
-        try {
-          const raw = await redis().get(dataKey(tid, relPath));
-          if (raw) {
-            const txt = typeof raw === 'string' ? raw : raw.toString('utf8');
-            const parsed = JSON.parse(txt);
+        if (r) {
+          try {
+            const raw = await r.get(dataKey(tid, relPath));
+            if (raw) {
+              const txt = typeof raw === 'string' ? raw : raw.toString('utf8');
+              const parsed = JSON.parse(txt);
+              if (Array.isArray(parsed)) list = parsed;
+            }
+          } catch (_) {}
+        } else {
+          try {
+            const raw = await fsp.readFile(path.join(getVaultRoot(tid), relPath), 'utf8');
+            const parsed = JSON.parse(raw);
             if (Array.isArray(parsed)) list = parsed;
-          }
-        } catch (_) {}
-        const merged = mergeCommunityList(list);
-        if (encoding) {
-          return res.type('text/plain; charset=utf-8').send(JSON.stringify(merged));
+          } catch (_) {}
         }
+        const merged = mergeCommunityList(list);
+        if (encoding) return res.type('text/plain; charset=utf-8').send(JSON.stringify(merged));
         return res.type('application/json').send(JSON.stringify(merged));
       }
 
-      // System plugin overlay: if this is a system plugin file AND the vault
-      // doesn't have it, serve from <repo>/plugins/.
       const systemPath = tryGetSystemFilePath(relPath);
       if (systemPath) {
-        const inRedis = await redis().hexists(treeKey(tid), relPath);
-        if (!inRedis) {
-          if (encoding) {
-            const data = await fsp.readFile(systemPath, encoding);
-            return res.type('text/plain; charset=utf-8').send(data);
-          }
-          const data = await fsp.readFile(systemPath);
-          return res.type('application/octet-stream').send(data);
+        var inVault = false;
+        if (r) {
+          inVault = await r.hexists(treeKey(tid), relPath);
+        } else {
+          try { await fsp.stat(path.join(getVaultRoot(tid), relPath)); inVault = true; } catch (_) {}
+        }
+        if (!inVault) {
+          if (encoding) { const data = await fsp.readFile(systemPath, encoding); return res.type('text/plain; charset=utf-8').send(data); }
+          const data = await fsp.readFile(systemPath); return res.type('application/octet-stream').send(data);
         }
       }
 
-      const content = await redis().get(dataKey(tid, relPath));
-      if (content === null || content === undefined) {
-        throw Object.assign(new Error('ENOENT: ' + relPath), { code: 'ENOENT' });
-      }
-      if (encoding) {
-        res.type('text/plain; charset=utf-8').send(
-          typeof content === 'string' ? content : content.toString(encoding),
-        );
+      if (r) {
+        const content = await r.get(dataKey(tid, relPath));
+        if (content === null || content === undefined) throw Object.assign(new Error('ENOENT: ' + relPath), { code: 'ENOENT' });
+        if (encoding) { res.type('text/plain; charset=utf-8').send(typeof content === 'string' ? content : content.toString(encoding)); }
+        else { res.type('application/octet-stream').send(typeof content === 'string' ? Buffer.from(content) : content); }
       } else {
-        res.type('application/octet-stream').send(
-          typeof content === 'string' ? Buffer.from(content) : content,
-        );
+        var root = getVaultRoot(tid);
+        var fullPath = path.join(root, relPath);
+        if (encoding) {
+          const data = await fsp.readFile(fullPath, encoding);
+          res.type('text/plain; charset=utf-8').send(data);
+        } else {
+          const data = await fsp.readFile(fullPath);
+          res.type('application/octet-stream').send(data);
+        }
       }
     } catch (err) {
       handleError(res, err);
     }
   });
 
-  // ── PUT /write ───────────────────────────────────────────────────────────
-
   router.put('/write', express.raw({ type: '*/*', limit: '256mb' }), async (req, res) => {
     const tid = getVaultId(req);
+    const r = redis();
     try {
       const relPath = req.query.path || '';
       const safe = safePath(relPath);
       const encoding = req.query.encoding || null;
       let data = encoding ? req.body.toString(encoding) : req.body;
 
-      // For community-plugins.json: strip system plugin ids before writing
       if (safe === '.obsidian/community-plugins.json' && encoding) {
-        try {
-          const parsed = JSON.parse(data);
-          if (Array.isArray(parsed)) {
-            const cleaned = stripCommunityList(parsed);
-            data = JSON.stringify(cleaned, null, 2);
-          }
-        } catch (_) {}
+        try { const parsed = JSON.parse(data); if (Array.isArray(parsed)) { const cleaned = stripCommunityList(parsed); data = JSON.stringify(cleaned, null, 2); } } catch (_) {}
       }
 
-      const contentStr = encoding
-        ? data
-        : (Buffer.isBuffer(data) ? data.toString('base64') : String(data));
-      const stats = makeStats(safe, false);
-      stats.size = encoding
-        ? Buffer.byteLength(data, 'utf8')
-        : (Buffer.isBuffer(data) ? data.length : 0);
-
-      const pipe = redis().pipeline();
-      pipe.set(dataKey(tid, safe), contentStr);
-      pipe.hset(treeKey(tid), safe, JSON.stringify(stats));
-      await pipe.exec();
-
-      await ensureParentDirs(redis, tid, safe);
-      invalidateBootstrapCache(tid);
+      if (r) {
+        const contentStr = encoding ? data : (Buffer.isBuffer(data) ? data.toString('base64') : String(data));
+        const stats = makeStats(safe, false);
+        stats.size = encoding ? Buffer.byteLength(data, 'utf8') : (Buffer.isBuffer(data) ? data.length : 0);
+        const pipe = r.pipeline();
+        pipe.set(dataKey(tid, safe), contentStr);
+        pipe.hset(treeKey(tid), safe, JSON.stringify(stats));
+        await pipe.exec();
+        await ensureParentDirs(r, tid, safe);
+        invalidateBootstrapCache(tid);
+      } else {
+        var root = getVaultRoot(tid);
+        var fullPath = path.join(root, safe);
+        await fsp.mkdir(path.dirname(fullPath), { recursive: true });
+        if (encoding) { await fsp.writeFile(fullPath, data, encoding); }
+        else { await fsp.writeFile(fullPath, data); }
+      }
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
   });
-
-  // ── POST /mkdir ──────────────────────────────────────────────────────────
 
   router.post('/mkdir', express.json(), async (req, res) => {
     const tid = getVaultId(req);
+    const r = redis();
     try {
       const safe = safePath(req.body.path || '');
-      const stats = makeStats(safe, true);
-      await redis().hset(treeKey(tid), safe, JSON.stringify(stats));
-      await ensureParentDirs(redis, tid, safe);
-      invalidateBootstrapCache(tid);
+      if (r) {
+        const stats = makeStats(safe, true);
+        await r.hset(treeKey(tid), safe, JSON.stringify(stats));
+        await ensureParentDirs(r, tid, safe);
+        invalidateBootstrapCache(tid);
+      } else {
+        await fsp.mkdir(path.join(getVaultRoot(tid), safe), { recursive: true });
+      }
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
   });
-
-  // ── DELETE /unlink ───────────────────────────────────────────────────────
 
   router.delete('/unlink', async (req, res) => {
     const tid = getVaultId(req);
+    const r = redis();
     try {
       const safe = safePath(req.query.path || '');
-      const pipe = redis().pipeline();
-      pipe.del(dataKey(tid, safe));
-      pipe.hdel(treeKey(tid), safe);
-      await pipe.exec();
-      invalidateBootstrapCache(tid);
+      if (r) {
+        const pipe = r.pipeline();
+        pipe.del(dataKey(tid, safe));
+        pipe.hdel(treeKey(tid), safe);
+        await pipe.exec();
+        invalidateBootstrapCache(tid);
+      } else {
+        await fsp.unlink(path.join(getVaultRoot(tid), safe));
+      }
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
   });
-
-  // ── DELETE /rmdir ────────────────────────────────────────────────────────
 
   router.delete('/rmdir', async (req, res) => {
     const tid = getVaultId(req);
+    const r = redis();
     try {
       const safe = safePath(req.query.path || '');
       const recursive = req.query.recursive === '1';
-      const prefix = safe + '/';
-      const allKeys = await redis().hkeys(treeKey(tid));
-      const toDelete = allKeys.filter(k => k === safe || k.startsWith(prefix));
-
-      if (!recursive && toDelete.length > 1) {
-        const err = new Error('directory not empty');
-        err.code = 'ENOTEMPTY';
-        throw err;
+      if (r) {
+        const prefix = safe + '/';
+        const allKeys = await r.hkeys(treeKey(tid));
+        const toDelete = allKeys.filter(k => k === safe || k.startsWith(prefix));
+        if (!recursive && toDelete.length > 1) { const err = new Error('directory not empty'); err.code = 'ENOTEMPTY'; throw err; }
+        const pipe = r.pipeline();
+        for (const key of toDelete) { pipe.hdel(treeKey(tid), key); pipe.del(dataKey(tid, key)); }
+        await pipe.exec();
+        invalidateBootstrapCache(tid);
+      } else {
+        var root = getVaultRoot(tid);
+        if (recursive) { await fsp.rm(path.join(root, safe), { recursive: true, force: true }); }
+        else { await fsp.rmdir(path.join(root, safe)); }
       }
-
-      const pipe = redis().pipeline();
-      for (const key of toDelete) {
-        pipe.hdel(treeKey(tid), key);
-        pipe.del(dataKey(tid, key));
-      }
-      await pipe.exec();
-      invalidateBootstrapCache(tid);
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
   });
-
-  // ── POST /rename ─────────────────────────────────────────────────────────
 
   router.post('/rename', express.json(), async (req, res) => {
     const tid = getVaultId(req);
+    const r = redis();
     try {
       const oldPath = safePath(req.body.oldPath || '');
       const newPath = safePath(req.body.newPath || '');
-
-      const allKeys = await redis().hkeys(treeKey(tid));
-      const prefix = oldPath + '/';
-      const affected = allKeys.filter(k => k === oldPath || k.startsWith(prefix));
-
-      // Read all affected entries first, then write/delete in one pipeline
-      const entries = [];
-      for (const key of affected) {
-        const newKey = newPath + key.slice(oldPath.length);
-        const stats = await redis().hget(treeKey(tid), key);
-        const data = await redis().get(dataKey(tid, key));
-        entries.push({ key, newKey, stats, data });
-      }
-
-      const pipe = redis().pipeline();
-      for (const { key, newKey, stats, data } of entries) {
-        if (stats) pipe.hset(treeKey(tid), newKey, stats);
-        pipe.hdel(treeKey(tid), key);
-        if (data !== null && data !== undefined) {
-          pipe.set(dataKey(tid, newKey), data);
+      if (r) {
+        const allKeys = await r.hkeys(treeKey(tid));
+        const prefix = oldPath + '/';
+        const affected = allKeys.filter(k => k === oldPath || k.startsWith(prefix));
+        const entries = [];
+        for (const key of affected) {
+          const newKey = newPath + key.slice(oldPath.length);
+          const stats = await r.hget(treeKey(tid), key);
+          const data = await r.get(dataKey(tid, key));
+          entries.push({ key, newKey, stats, data });
         }
-        pipe.del(dataKey(tid), key);
+        const pipe = r.pipeline();
+        for (const { key, newKey, stats, data } of entries) {
+          if (stats) pipe.hset(treeKey(tid), newKey, stats);
+          pipe.hdel(treeKey(tid), key);
+          if (data !== null && data !== undefined) { pipe.set(dataKey(tid, newKey), data); }
+          pipe.del(dataKey(tid), key);
+        }
+        await pipe.exec();
+        invalidateBootstrapCache(tid);
+      } else {
+        var root = getVaultRoot(tid);
+        await fsp.rename(path.join(root, oldPath), path.join(root, newPath));
       }
-      await pipe.exec();
-      invalidateBootstrapCache(tid);
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
     }
   });
 
-  // ── POST /copy ───────────────────────────────────────────────────────────
-
   router.post('/copy', express.json(), async (req, res) => {
     const tid = getVaultId(req);
+    const r = redis();
     try {
       const src = safePath(req.body.src || '');
       const dest = safePath(req.body.dest || '');
-
-      const allKeys = await redis().hkeys(treeKey(tid));
-      const prefix = src + '/';
-      const affected = allKeys.filter(k => k === src || k.startsWith(prefix));
-
-      const entries = [];
-      for (const key of affected) {
-        const newKey = dest + key.slice(src.length);
-        const stats = await redis().hget(treeKey(tid), key);
-        const data = await redis().get(dataKey(tid, key));
-        entries.push({ newKey, stats, data });
-      }
-
-      const pipe = redis().pipeline();
-      for (const { newKey, stats, data } of entries) {
-        if (stats) pipe.hset(treeKey(tid), newKey, stats);
-        if (data !== null && data !== undefined) {
-          pipe.set(dataKey(tid, newKey), data);
+      if (r) {
+        const allKeys = await r.hkeys(treeKey(tid));
+        const prefix = src + '/';
+        const affected = allKeys.filter(k => k === src || k.startsWith(prefix));
+        const entries = [];
+        for (const key of affected) {
+          const newKey = dest + key.slice(src.length);
+          const stats = await r.hget(treeKey(tid), key);
+          const data = await r.get(dataKey(tid, key));
+          entries.push({ newKey, stats, data });
         }
+        const pipe = r.pipeline();
+        for (const { newKey, stats, data } of entries) {
+          if (stats) pipe.hset(treeKey(tid), newKey, stats);
+          if (data !== null && data !== undefined) { pipe.set(dataKey(tid, newKey), data); }
+        }
+        await pipe.exec();
+        invalidateBootstrapCache(tid);
+      } else {
+        var root = getVaultRoot(tid);
+        var srcPath = path.join(root, src);
+        var dstPath = path.join(root, dest);
+        var s = await fsp.stat(srcPath);
+        if (s.isDirectory()) { await fsp.cp(srcPath, dstPath, { recursive: true }); }
+        else { await fsp.mkdir(path.dirname(dstPath), { recursive: true }); await fsp.copyFile(srcPath, dstPath); }
       }
-      await pipe.exec();
-      invalidateBootstrapCache(tid);
       res.json({ ok: true });
     } catch (err) {
       handleError(res, err);
