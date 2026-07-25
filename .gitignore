@@ -47,3 +47,4 @@ myvault/
 
 # Local environment config
 .env
+.vercel
