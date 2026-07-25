@@ -53,10 +53,15 @@ function getRelPath(absPath) {
   throw new Error('File outside expected roots: ' + absPath);
 }
 
+function shouldSkip(name) {
+  return name === '.DS_Store' || name === 'Thumbs.db';
+}
+
 async function getAllFiles(dir) {
   const files = [];
   const entries = await fsp.readdir(dir, { withFileTypes: true });
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (shouldSkip(entry.name)) continue;
     const abs = path.join(dir, entry.name);
     if (entry.isDirectory()) files.push(...await getAllFiles(abs));
     else files.push(abs);
@@ -78,17 +83,26 @@ async function main() {
   const allFiles = [...vaultFiles, ...obsidianFiles];
   console.log('Found ' + allFiles.length + ' files (' + vaultFiles.length + ' from vault, ' + obsidianFiles.length + ' from .obsidian)');
 
-  console.log('Cleaning old ../.obsidian/ prefixed data...');
+  console.log('Cleaning stale entries...');
   {
-    const treeKeysResult = await upstash(url, token, '/hkeys/vault:' + VAULT_ID + ':tree');
-    const oldKeys = Array.isArray(treeKeysResult) ? treeKeysResult.filter(k => typeof k === 'string' && k.startsWith('../')) : [];
-    if (oldKeys.length > 0) {
-      const delPipe = oldKeys.map(k => ['HDEL', 'vault:' + VAULT_ID + ':tree', k]);
+    const raw = await upstash(url, token, '/hkeys/vault:' + VAULT_ID + ':tree');
+    const allKeys = (raw && raw.result && Array.isArray(raw.result)) ? raw.result.filter(k => typeof k === 'string') : [];
+    const stale = allKeys.filter(k => {
+      if (k === '..' || k.startsWith('../')) return true;
+      if (k.startsWith('plugins/') || k.startsWith('themes/') || k.startsWith('snippets/')) return true;
+      if (shouldSkip(k)) return true;
+      return false;
+    });
+    if (stale.length > 0) {
+      console.log('  found ' + stale.length + ' stale entries (e.g. ' + stale.slice(0, 2).join(', ') + ')');
+      const delPipe = stale.map(k => ['HDEL', 'vault:' + VAULT_ID + ':tree', k]);
       await upstash(url, token, '/pipeline', delPipe);
-      for (const k of oldKeys) {
-        await upstash(url, token, '/pipeline', [['DEL', 'vault:' + VAULT_ID + ':data:' + k]]);
+      for (let i = 0; i < stale.length; i += 20) {
+        const batch = stale.slice(i, i + 20);
+        const dataPipe = batch.map(k => ['DEL', 'vault:' + VAULT_ID + ':data:' + k]);
+        await upstash(url, token, '/pipeline', dataPipe);
       }
-      console.log('  removed ' + oldKeys.length + ' old prefixed entries');
+      console.log('  removed ' + stale.length + ' stale entries');
     } else {
       console.log('  nothing to clean');
     }
