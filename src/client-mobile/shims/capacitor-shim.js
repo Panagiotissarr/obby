@@ -217,6 +217,20 @@
         }
       }
 
+      // Static serve for .obsidian/ vault config (theme, plugins, snippets).
+      // Files are served directly by Express, bypassing the Redis/API layer.
+      if (p.startsWith('.obsidian/')) {
+        const staticUrl = '/obsidian/static/' + p.slice('.obsidian/'.length);
+        const staticRes = await fetch(staticUrl);
+        if (staticRes.ok) {
+          if (encoding) {
+            return { data: await staticRes.text() };
+          } else {
+            return { data: arrayBufferToBase64(await staticRes.arrayBuffer()) };
+          }
+        }
+      }
+
       const url = '/api/fs/read?' + vaultQuery() + 'path=' + encodePath(p) +
         (encoding ? '&encoding=' + encoding : '');
       const res = await fetch(url);

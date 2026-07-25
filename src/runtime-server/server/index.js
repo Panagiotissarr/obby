@@ -131,6 +131,13 @@ function createApp(appConfig = {}) {
     setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache'),
   }));
 
+  // Serve .obsidian/ vault config (theme, plugins, snippets) as static files
+  // so they load reliably without going through the Redis/API layer.
+  const obsidianConfigPath = path.join(appConfig.projectRoot, '.obsidian');
+  app.use('/obsidian/static', express.static(obsidianConfigPath, {
+    setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache'),
+  }));
+
   // Obsidian's renderer fetches resources via absolute paths like /i18n/he.txt
   // and /lib/... because under Electron those resolve via the app:// protocol
   // to the bundle root. Mirror them onto the obsidian-mobile/ tree (the only
