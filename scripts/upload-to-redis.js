@@ -89,8 +89,10 @@ async function main() {
     const allKeys = (raw && raw.result && Array.isArray(raw.result)) ? raw.result.filter(k => typeof k === 'string') : [];
     const stale = allKeys.filter(k => {
       if (k === '..' || k.startsWith('../')) return true;
+      if (k === 'plugins' || k === 'themes' || k === 'snippets') return true;
       if (k.startsWith('plugins/') || k.startsWith('themes/') || k.startsWith('snippets/')) return true;
       if (shouldSkip(k)) return true;
+      if (/^\d+$/.test(k)) return true;
       return false;
     });
     if (stale.length > 0) {

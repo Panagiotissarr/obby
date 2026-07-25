@@ -14,7 +14,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 
-const { getRedis, treeKey, dataKey } = require('../redis');
+const { getRedis, treeKey, dataKey, getTreeEntries } = require('../redis');
 
 const {
   tryGetSystemFilePath,
@@ -200,10 +200,16 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
           const s = parseStats(raw);
           if (s) return res.json(s);
         }
-        const allKeys = await r.hkeys(treeKey(tid)) || [];
-        if (Array.isArray(allKeys)) {
+        // Fallback: use getTreeEntries (handles flattened-index corruption transparently)
+        const allEntries = await getTreeEntries(tid);
+        if (allEntries && Object.keys(allEntries).length > 0) {
+          const directStat = allEntries[relPath];
+          if (directStat) {
+            const s = parseStats(directStat);
+            if (s) return res.json(s);
+          }
           const prefix = relPath + '/';
-          const hasChildren = allKeys.some(k => typeof k === 'string' && k.startsWith(prefix));
+          const hasChildren = Object.keys(allEntries).some(k => k.startsWith(prefix));
           if (hasChildren) {
             return res.json(makeStats(relPath, true));
           }
@@ -272,14 +278,13 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       }
 
       const prefix = relPath ? relPath + '/' : '';
-      const allKeys = await r.hkeys(treeKey(tid)) || [];
+      const allEntries = await getTreeEntries(tid);
       const childMap = new Map();
 
-      for (const key of allKeys) {
-        if (typeof key !== 'string') continue;
-        if (prefix && !key.startsWith(prefix)) continue;
-        if (!prefix && key.indexOf('/') !== -1) continue;
-        const rest = prefix ? key.slice(prefix.length) : key;
+      for (const [entryPath, statsJson] of Object.entries(allEntries)) {
+        if (prefix && !entryPath.startsWith(prefix)) continue;
+        if (!prefix && entryPath.indexOf('/') !== -1) continue;
+        const rest = prefix ? entryPath.slice(prefix.length) : entryPath;
         if (!rest) continue;
         const slashIdx = rest.indexOf('/');
         if (slashIdx !== -1) {
@@ -289,8 +294,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
           }
         } else {
           if (!childMap.has(rest)) {
-            const raw = await r.hget(treeKey(tid), key);
-            const s = parseStats(raw);
+            const s = parseStats(statsJson);
             childMap.set(rest, {
               name: rest,
               isFile: s ? s.isFile : true,
@@ -305,8 +309,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       for (const [name, entry] of childMap) {
         if (entry.isDirectory && !entry.stats) {
           const dirPath = prefix + name;
-          const raw = await r.hget(treeKey(tid), dirPath);
-          const s = parseStats(raw);
+          const s = parseStats(allEntries[dirPath]);
           if (s) { entry.stats = { isFile: s.isFile, isDirectory: s.isDirectory, isSymbolicLink: false, size: s.size, mtime: s.mtime, ctime: s.ctime, atime: s.atime, birthtime: s.birthtime, mode: s.mode }; }
         }
       }

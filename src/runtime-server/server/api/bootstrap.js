@@ -20,7 +20,7 @@ const express = require('express');
 const path = require('path');
 const zlib = require('zlib');
 const config = require('../config');
-const { getRedis, treeKey, dataKey } = require('../redis');
+const { getRedis, treeKey, dataKey, getTreeEntries } = require('../redis');
 
 // ── Server-side bootstrap cache ───────────────────────────────────────────
 const serverCache = new Map();
@@ -92,8 +92,8 @@ async function walkRedisTree(vaultId, full, progress, budget) {
   const fsCache = {};
   const dirsCache = {};
 
-  const allEntries = await redis.hgetall(treeKey(vaultId));
-  if (!allEntries) return { fsCache, dirsCache };
+  const allEntries = await getTreeEntries(vaultId);
+  if (!allEntries || Object.keys(allEntries).length === 0) return { fsCache, dirsCache };
 
   // Group entries by parent directory
   const dirChildren = new Map();

@@ -63,4 +63,41 @@ async function addVaultToIndex(vaultId) {
   }
 }
 
-module.exports = { getRedis, treeKey, dataKey, listVaultIds, addVaultToIndex };
+async function getTreeEntries(vaultId) {
+  const redis = getRedis();
+  const key = treeKey(vaultId);
+  const raw = await redis.hgetall(key);
+  if (!raw) return {};
+
+  const allKeys = Object.keys(raw);
+  if (allKeys.length === 0) return {};
+
+  // Detect flattened indexed format {0: path, 1: statsJSON, 2: path, 3: statsJSON, ...}
+  // which happens when Object.entries(hgetall).flat() is written back to the hash.
+  // If most keys are numeric, reconstruct from pairs.
+  // Non-numeric keys (from recent saves on a corrupted tree) are merged as-is.
+  const numericKeys = allKeys.filter(k => /^\d+$/.test(k));
+  const nonNumericKeys = allKeys.filter(k => !/^\d+$/.test(k));
+  if (numericKeys.length > 0 && numericKeys.length > nonNumericKeys.length) {
+    const corrected = {};
+    const sorted = numericKeys.map(Number).sort((a, b) => a - b);
+    for (let i = 0; i < sorted.length; i += 2) {
+      const path = raw[String(sorted[i])];
+      const stats = raw[String(sorted[i + 1])];
+      if (typeof path === 'string' && typeof stats === 'string') {
+        corrected[path] = stats;
+      }
+    }
+    for (const k of nonNumericKeys) {
+      corrected[k] = raw[k];
+    }
+    if (Object.keys(corrected).length > 0) {
+      console.log(`[redis] tree ${key} was in flattened format — reconstructed ${Object.keys(corrected).length} entries (${Object.keys(corrected).length - nonNumericKeys.length} from pairs, ${nonNumericKeys.length} direct)`);
+      return corrected;
+    }
+  }
+
+  return raw;
+}
+
+module.exports = { getRedis, treeKey, dataKey, listVaultIds, addVaultToIndex, getTreeEntries };
