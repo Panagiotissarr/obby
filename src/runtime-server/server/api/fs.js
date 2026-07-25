@@ -373,8 +373,9 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       if (r) {
         const content = await r.get(dataKey(tid, relPath));
         if (content === null || content === undefined) throw Object.assign(new Error('ENOENT: ' + relPath), { code: 'ENOENT' });
-        if (encoding) { res.type('text/plain; charset=utf-8').send(typeof content === 'string' ? content : content.toString(encoding)); }
-        else { res.type('application/octet-stream').send(typeof content === 'string' ? Buffer.from(content) : content); }
+        const str = typeof content === 'string' ? content : JSON.stringify(content);
+        if (encoding) { res.type('text/plain; charset=utf-8').send(str); }
+        else { res.type('application/octet-stream').send(Buffer.from(str)); }
       } else {
         var root = getVaultRoot(tid);
         var fullPath = path.join(root, relPath);

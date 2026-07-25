@@ -42,5 +42,8 @@ Time-Garden
 # User vault folder
 myvault/
 
+# Obsidian vault configuration (plugins, theme, settings)
+.obsidian/
+
 # Local environment config
 .env
