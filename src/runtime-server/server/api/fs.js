@@ -203,7 +203,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         const allKeys = await r.hkeys(treeKey(tid)) || [];
         if (Array.isArray(allKeys)) {
           const prefix = relPath + '/';
-          const hasChildren = allKeys.some(k => k.startsWith(prefix));
+          const hasChildren = allKeys.some(k => typeof k === 'string' && k.startsWith(prefix));
           if (hasChildren) {
             return res.json(makeStats(relPath, true));
           }
@@ -276,6 +276,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       const childMap = new Map();
 
       for (const key of allKeys) {
+        if (typeof key !== 'string') continue;
         if (prefix && !key.startsWith(prefix)) continue;
         if (!prefix && key.indexOf('/') !== -1) continue;
         const rest = prefix ? key.slice(prefix.length) : key;
@@ -486,8 +487,8 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       const recursive = req.query.recursive === '1';
       if (r) {
         const prefix = safe + '/';
-        const allKeys = await r.hkeys(treeKey(tid));
-        const toDelete = allKeys.filter(k => k === safe || k.startsWith(prefix));
+        const allKeys = await r.hkeys(treeKey(tid)) || [];
+        const toDelete = allKeys.filter(k => typeof k === 'string' && (k === safe || k.startsWith(prefix)));
         if (!recursive && toDelete.length > 1) { const err = new Error('directory not empty'); err.code = 'ENOTEMPTY'; throw err; }
         const pipe = r.pipeline();
         for (const key of toDelete) { pipe.hdel(treeKey(tid), key); pipe.del(dataKey(tid, key)); }
@@ -511,9 +512,9 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       const oldPath = safePath(req.body.oldPath || '');
       const newPath = safePath(req.body.newPath || '');
       if (r) {
-        const allKeys = await r.hkeys(treeKey(tid));
+        const allKeys = await r.hkeys(treeKey(tid)) || [];
         const prefix = oldPath + '/';
-        const affected = allKeys.filter(k => k === oldPath || k.startsWith(prefix));
+        const affected = allKeys.filter(k => typeof k === 'string' && (k === oldPath || k.startsWith(prefix)));
         const entries = [];
         for (const key of affected) {
           const newKey = newPath + key.slice(oldPath.length);
@@ -547,9 +548,9 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       const src = safePath(req.body.src || '');
       const dest = safePath(req.body.dest || '');
       if (r) {
-        const allKeys = await r.hkeys(treeKey(tid));
+        const allKeys = await r.hkeys(treeKey(tid)) || [];
         const prefix = src + '/';
-        const affected = allKeys.filter(k => k === src || k.startsWith(prefix));
+        const affected = allKeys.filter(k => typeof k === 'string' && (k === src || k.startsWith(prefix)));
         const entries = [];
         for (const key of affected) {
           const newKey = dest + key.slice(src.length);
