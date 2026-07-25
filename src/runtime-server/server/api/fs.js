@@ -311,7 +311,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         }
       }
 
-      var result = Array.from(childMap.values());
+      var result = Array.from(childMap.values()).filter(e => !e.name.startsWith('.'));
       if (isPluginsDir) {
         for (const id of getSystemPluginIds()) {
           if (!result.find(e => e.name === id)) {
@@ -381,6 +381,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         const isBase64 = s && s.encoding === 'base64';
         if (isBase64) {
           const bin = Buffer.from(typeof content === 'string' ? content : JSON.stringify(content), 'base64');
+          res.set('Cache-Control', 'public, max-age=86400');
           if (encoding) {
             res.type('text/plain; charset=utf-8').send(bin.toString('utf8'));
           } else {

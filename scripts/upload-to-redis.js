@@ -78,6 +78,22 @@ async function main() {
   const allFiles = [...vaultFiles, ...obsidianFiles];
   console.log('Found ' + allFiles.length + ' files (' + vaultFiles.length + ' from vault, ' + obsidianFiles.length + ' from .obsidian)');
 
+  console.log('Cleaning old ../.obsidian/ prefixed data...');
+  {
+    const treeKeysResult = await upstash(url, token, '/hkeys/vault:' + VAULT_ID + ':tree');
+    const oldKeys = Array.isArray(treeKeysResult) ? treeKeysResult.filter(k => typeof k === 'string' && k.startsWith('../')) : [];
+    if (oldKeys.length > 0) {
+      const delPipe = oldKeys.map(k => ['HDEL', 'vault:' + VAULT_ID + ':tree', k]);
+      await upstash(url, token, '/pipeline', delPipe);
+      for (const k of oldKeys) {
+        await upstash(url, token, '/pipeline', [['DEL', 'vault:' + VAULT_ID + ':data:' + k]]);
+      }
+      console.log('  removed ' + oldKeys.length + ' old prefixed entries');
+    } else {
+      console.log('  nothing to clean');
+    }
+  }
+
   let treeCount = 0;
   let dataCount = 0;
   let failed = [];
