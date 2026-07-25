@@ -557,17 +557,29 @@
       // §4 Commit 2.2 (internal references must stay pinned to this backend).
       await HttpFilesystem.startWatch(opts);
 
-      // Always fetch fresh bootstrap from the API.
-      // Using the cached dirs from window.__owBootstrapCache can miss entries
-      // for deeply nested directories like 02 Daily/2026/07-July.
-      const vaultId = getVaultId();
-      const res = await fetch(
-        '/api/bootstrap?vault=' + encodeURIComponent(vaultId) + '&full=1',
-        { headers: { 'Accept-Encoding': 'br, gzip' } },
-      );
-      if (!res.ok) throw capError('EIO', 'watchAndStatAll failed');
-      const data = await res.json();
-      const dirs = data.dirs || {};
+      // Use the bootstrap cache populated by boot.js — it's the same
+      // /api/bootstrap?full=1 response we'd fetch here anyway, so awaiting
+      // the in-flight promise avoids a duplicate round-trip.
+      let dirs = null;
+      if (window.__owBootstrapPromise) {
+        await window.__owBootstrapPromise.catch(() => null);
+      }
+      if (window.__owBootstrapCache && window.__owBootstrapCache.dirs) {
+        dirs = window.__owBootstrapCache.dirs;
+      }
+
+      // Fallback: bootstrap failed or is disabled — fetch directly so the
+      // adapter still gets its tree (slower path, but functional).
+      if (!dirs) {
+        const vaultId = getVaultId();
+        const res = await fetch(
+          '/api/bootstrap?vault=' + encodeURIComponent(vaultId) + '&full=1',
+          { headers: { 'Accept-Encoding': 'br, gzip' } },
+        );
+        if (!res.ok) throw capError('EIO', 'watchAndStatAll failed');
+        const data = await res.json();
+        dirs = data.dirs || {};
+      }
 
       // Flatten the entire dirs map into a single children array.
       // Each entry's name = its full relative vault path.
@@ -585,6 +597,8 @@
           });
         }
       }
+      console.log('[ow] watchAndStatAll children count:', children.length,
+        'dir02_2026:', dirs['02 Daily/2026'] ? dirs['02 Daily/2026'].length : 'missing');
       return { children };
     },
 
