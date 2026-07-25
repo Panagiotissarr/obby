@@ -9,7 +9,8 @@
     }
   },
   "redirects": [
-    { "source": "/", "destination": "/vault/9e5a814a277ce6c4/00%20Dashboard/Welcome", "permanent": false }
+    { "source": "/", "destination": "/vault/9e5a814a277ce6c4/00%20Dashboard/Welcome", "permanent": true }
+    { "source": "/vault/0000demo0000demo", "destination": "/vault/9e5a814a277ce6c4/00%20Dashboard/Welcome", "permanent": true }
   ],
   "routes": [
     { "src": "/(.*)", "dest": "/api/index.js" }
