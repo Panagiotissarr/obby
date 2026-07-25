@@ -77,11 +77,11 @@ function pathName(relPath) {
   return idx >= 0 ? relPath.substring(idx + 1) : relPath;
 }
 
-async function ensureParentDirs(redis, tid, relPath) {
+async function ensureParentDirs(client, tid, relPath) {
   const parts = relPath.split('/');
   parts.pop();
   let dir = '';
-  const pipeline = redis().pipeline();
+  const pipeline = client.pipeline();
   let dirty = false;
   for (const part of parts) {
     dir = dir ? dir + '/' + part : part;
@@ -91,7 +91,7 @@ async function ensureParentDirs(redis, tid, relPath) {
   if (!dirty) return;
   const results = await pipeline.exec();
 
-  const pipe2 = redis().pipeline();
+  const pipe2 = client.pipeline();
   let i = 0;
   dir = '';
   for (const part of parts) {

@@ -87,7 +87,8 @@ function parseStats(json) {
 // ── Redis-based vault walk ───────────────────────────────────────────────
 
 async function walkRedisTree(vaultId, full, progress, budget) {
-  const redis = getRedis();
+  let redis;
+  try { redis = getRedis(); } catch (_) { return { fsCache: {}, dirsCache: {} }; }
   const fsCache = {};
   const dirsCache = {};
 
@@ -180,6 +181,75 @@ async function walkRedisTree(vaultId, full, progress, budget) {
   return { fsCache, dirsCache };
 }
 
+// ── Filesystem-based vault walk (fallback when Redis is unavailable) ──────
+
+async function walkFileSystemTree(vaultRoot, full, progress, budget) {
+  const fsCache = {};
+  const dirsCache = {};
+  const fsp = require('fs/promises');
+
+  async function walkDir(dirRelPath) {
+    const absPath = dirRelPath ? path.join(vaultRoot, dirRelPath) : vaultRoot;
+    let entries;
+    try { entries = await fsp.readdir(absPath, { withFileTypes: true }); } catch { return; }
+
+    const children = [];
+    for (const entry of entries) {
+      // Skip hidden files unless full walk
+      if (!full && entry.name.startsWith('.')) continue;
+
+      const relPath = dirRelPath ? dirRelPath + '/' + entry.name : entry.name;
+      let stat;
+      try { stat = await fsp.stat(path.join(absPath, entry.name)); } catch { continue; }
+
+      const entryInfo = {
+        name: entry.name,
+        isFile: entry.isFile(),
+        isDirectory: entry.isDirectory(),
+        isSymbolicLink: entry.isSymbolicLink() || false,
+        mtime: stat.mtimeMs,
+        size: stat.size,
+      };
+      children.push(entryInfo);
+
+      if (entry.isFile() && isTextFile(relPath, stat.size)) {
+        fsCache[relPath] = { mtime: stat.mtimeMs, size: stat.size, isFile: true };
+        if (full) {
+          if (budget && budget.remaining < stat.size) {
+            budget.capped = true;
+          } else {
+            if (budget) budget.remaining -= stat.size;
+            try {
+              const content = await fsp.readFile(path.join(absPath, entry.name), 'utf8');
+              fsCache[relPath].content = content;
+              if (progress) {
+                progress.filesRead = (progress.filesRead || 0) + 1;
+                progress.cb();
+              }
+            } catch {}
+          }
+        }
+      } else if (entry.isDirectory()) {
+        fsCache[relPath] = { mtime: stat.mtimeMs, size: stat.size, isFile: false, isDirectory: true };
+        await walkDir(relPath);
+      } else {
+        fsCache[relPath] = { mtime: stat.mtimeMs, size: stat.size, isFile: true };
+      }
+    }
+
+    const dirKey = dirRelPath || '';
+    dirsCache[dirKey] = children;
+    if (progress) {
+      progress.dirs = Object.keys(dirsCache).length;
+      progress.files = Object.keys(fsCache).filter(k => fsCache[k].isFile !== false).length;
+      progress.cb();
+    }
+  }
+
+  await walkDir('');
+  return { fsCache, dirsCache };
+}
+
 // ── core build ────────────────────────────────────────────────────────────
 
 function buildElectronValues(vaultId, vaultRegistry) {
@@ -244,7 +314,20 @@ async function _buildCacheEntry(vaultId, vaultRoot, vaultRegistry, full = false)
     capped: false,
   } : null;
 
-  const { fsCache, dirsCache } = await walkRedisTree(vaultId, full, progress, budget);
+  let fsCache, dirsCache;
+  const redisResult = await walkRedisTree(vaultId, full, progress, budget);
+  const hasRedisFiles = Object.keys(redisResult.fsCache).length > 0 || Object.keys(redisResult.dirsCache).length > 0;
+  if (hasRedisFiles) {
+    fsCache = redisResult.fsCache;
+    dirsCache = redisResult.dirsCache;
+  } else if (vaultRoot) {
+    const fsResult = await walkFileSystemTree(vaultRoot, full, progress, budget);
+    fsCache = fsResult.fsCache;
+    dirsCache = fsResult.dirsCache;
+  } else {
+    fsCache = {};
+    dirsCache = {};
+  }
 
   setProgress(vaultId, { state: 'reading', label: 'Reading files...', pct: 80 });
   const fileCount = Object.keys(fsCache).length;
@@ -328,16 +411,31 @@ function createBootstrapRouter(vaultRegistry, fallbackVaultRoot, bootstrapConfig
         .catch((err) => console.warn('[bootstrap] background full build error:', err.message));
       entry = existing;
     } else {
-      entry = await buildCacheEntry(vaultId, vaultRoot, vaultRegistry, full);
+      try {
+        entry = await buildCacheEntry(vaultId, vaultRoot, vaultRegistry, full);
+      } catch (err) {
+        console.warn(`[bootstrap] build failed for vault ${vaultId.slice(0, 8)}…: ${err.message}`);
+        entry = existing;
+      }
+    }
+
+    if (!entry) {
+      return res.json({
+        disabled: false,
+        error: 'build failed',
+        electron: buildElectronValues(vaultId, vaultRegistry),
+        fs: {},
+        dirs: {},
+      });
     }
 
     const { compressed } = entry;
     const ae = req.headers['accept-encoding'] || '';
     let buf, encoding;
-    if (ae.includes('br') && compressed.br) {
+    if (ae.includes('br') && compressed?.br) {
       buf = compressed.br;
       encoding = 'br';
-    } else if ((ae.includes('gzip') || ae.includes('deflate')) && compressed.gz) {
+    } else if ((ae.includes('gzip') || ae.includes('deflate')) && compressed?.gz) {
       buf = compressed.gz;
       encoding = 'gzip';
     }
