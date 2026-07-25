@@ -127,6 +127,9 @@
   function fullPath(opts) {
     const prefix = opts.directory ? resolvePrefix(opts.directory) : '';
     let p = opts.path || '';
+    // Strip leading slash (Obsidian sometimes passes paths with vault ID
+    // prefixed and a leading /, e.g. "/9e5.../01 Notes/...").
+    if (p.startsWith('/')) p = p.slice(1);
     // The mobile bundle uses the vault ID as its "base path" for the vault.
     // Strip it so paths resolve correctly against our HTTP API.
     const vaultId = getVaultId();

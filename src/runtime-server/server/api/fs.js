@@ -200,10 +200,12 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
           if (s) return res.json(s);
         }
         const allKeys = await r.hkeys(treeKey(tid));
-        const prefix = relPath + '/';
-        const hasChildren = allKeys.some(k => k.startsWith(prefix));
-        if (hasChildren) {
-          return res.json(makeStats(relPath, true));
+        if (Array.isArray(allKeys)) {
+          const prefix = relPath + '/';
+          const hasChildren = allKeys.some(k => k.startsWith(prefix));
+          if (hasChildren) {
+            return res.json(makeStats(relPath, true));
+          }
         }
       } else {
         var root = getVaultRoot(tid);
@@ -269,7 +271,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       }
 
       const prefix = relPath ? relPath + '/' : '';
-      const allKeys = await r.hkeys(treeKey(tid));
+      const allKeys = await r.hkeys(treeKey(tid)) || [];
       const childMap = new Map();
 
       for (const key of allKeys) {
