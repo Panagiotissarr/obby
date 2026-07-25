@@ -1,10 +1,25 @@
 const express = require('express');
+const { listVaultIds, treeKey } = require('../redis');
 
 function createVaultsRouter(vaultRegistry) {
   const router = express.Router();
 
   router.get('/list', (req, res) => {
     res.json(vaultRegistry.list());
+  });
+
+  // GET /api/vaults/redis — list vaults stored in Redis via vault:index
+  router.get('/redis', async (req, res) => {
+    try {
+      const ids = await listVaultIds();
+      const result = {};
+      for (const id of ids) {
+        result[id] = { id, name: id, type: 'redis' };
+      }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   router.post('/open', express.json(), (req, res) => {

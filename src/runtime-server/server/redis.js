@@ -34,4 +34,33 @@ function dataKey(vaultId, relPath) {
   return `vault:${vaultId || 'default'}:data:${relPath}`;
 }
 
-module.exports = { getRedis, treeKey, dataKey };
+// Index key — stores a JSON array of known vault IDs so we can discover
+// vaults without scanning all keys (Upstash REST doesn't support KEYS).
+function indexKey() {
+  return 'vault:index';
+}
+
+async function listVaultIds() {
+  const redis = getRedis();
+  const raw = await redis.get(indexKey());
+  if (raw) {
+    try { return JSON.parse(raw); } catch (_) {}
+  }
+  return [];
+}
+
+async function addVaultToIndex(vaultId) {
+  if (!vaultId) return;
+  const redis = getRedis();
+  const raw = await redis.get(indexKey());
+  let ids = [];
+  if (raw) {
+    try { ids = JSON.parse(raw); } catch (_) {}
+  }
+  if (ids.indexOf(vaultId) === -1) {
+    ids.push(vaultId);
+    await redis.set(indexKey(), JSON.stringify(ids));
+  }
+}
+
+module.exports = { getRedis, treeKey, dataKey, listVaultIds, addVaultToIndex };

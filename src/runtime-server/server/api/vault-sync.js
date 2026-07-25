@@ -9,7 +9,7 @@
  */
 
 const express = require('express');
-const { getRedis, treeKey, dataKey } = require('../redis');
+const { getRedis, treeKey, dataKey, addVaultToIndex } = require('../redis');
 
 // Upstash REST pipelines have a max of ~1024 commands per request.
 // We stay well under the limit to avoid silent truncation.
@@ -114,6 +114,9 @@ function createVaultSyncRouter(vaultRegistry) {
         const { serverCache } = require('./bootstrap');
         if (serverCache) serverCache.delete(tid);
       } catch (_) {}
+
+      // Register vault ID in the index so it appears in Redis vault listings
+      try { await addVaultToIndex(tid); } catch (_) {}
 
       console.log('[vault-sync] save complete: vault=' + tid + ', saved=' + files.length + ', errors=' + errors);
       res.json({ ok: true, saved: files.length, errors });

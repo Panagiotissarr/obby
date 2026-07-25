@@ -104,6 +104,8 @@ const MOBILE_SCRIPTS = [
     if (!sel) localStorage.removeItem('obsidian-web:lastVaultId');
     if (resumeId) {
       location.replace('/vault/' + encodeURIComponent(resumeId));
+    } else if (window.__owConfig && window.__owConfig.defaultVaultId) {
+      location.replace('/vault/' + encodeURIComponent(window.__owConfig.defaultVaultId));
     } else {
       location.replace('/starter');
     }
@@ -494,6 +496,21 @@ const MOBILE_SCRIPTS = [
         });
       })
       .catch(function () { /* server vaults לא זמינים — ממשיכים עם local/folder בלבד */ })
+      // Redis vault discovery — vaults stored in Upstash Redis (KV)
+      .then(function () {
+        return fetch('/api/vaults/redis').then(function (r) {
+          if (!r.ok) return;
+          return r.json().then(function (res) {
+            Object.keys(res || {}).forEach(function (id) {
+              if (ids.indexOf(id) === -1) {
+                var v = res[id] || {};
+                items.push(id + '/' + (v.name || id));
+                ids.push(id);
+              }
+            });
+          });
+        }).catch(function () { /* Redis vaults לא זמינים — ממשיכים */ });
+      })
       .then(function () {
         localStorage.setItem('mobile-external-vaults', JSON.stringify(items));
         localStorage.setItem('ow-known-vault-ids', JSON.stringify(ids));

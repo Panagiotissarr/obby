@@ -74,7 +74,7 @@ async function ensureParentDirs(redis, tid, relPath) {
   const parts = relPath.split('/');
   parts.pop();
   let dir = '';
-  const pipeline = redis.pipeline();
+  const pipeline = redis().pipeline();
   let dirty = false;
   for (const part of parts) {
     dir = dir ? dir + '/' + part : part;
@@ -84,7 +84,7 @@ async function ensureParentDirs(redis, tid, relPath) {
   if (!dirty) return;
   const results = await pipeline.exec();
 
-  const pipe2 = redis.pipeline();
+  const pipe2 = redis().pipeline();
   let i = 0;
   dir = '';
   for (const part of parts) {
@@ -102,7 +102,11 @@ async function ensureParentDirs(redis, tid, relPath) {
 
 function createFsRouter(vaultRegistry, fallbackVaultRoot) {
   const router = express.Router();
-  const redis = getRedis();
+  var _redis = null;
+  function redis() {
+    if (!_redis) _redis = getRedis();
+    return _redis;
+  }
 
   function getVaultId(req) {
     return req.query.vault || 'default';
@@ -150,7 +154,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       if (relPath) {
         const systemPath = tryGetSystemFilePath(relPath);
         if (systemPath) {
-          const inRedis = await redis.hexists(treeKey(tid), relPath);
+          const inRedis = await redis().hexists(treeKey(tid), relPath);
           if (!inRedis) {
             const stats = await fsp.stat(systemPath);
             return res.json({
@@ -173,14 +177,14 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         return res.json(makeStats('', true));
       }
 
-      const raw = await redis.hget(treeKey(tid), relPath);
+      const raw = await redis().hget(treeKey(tid), relPath);
       if (raw) {
         const s = parseStats(raw);
         if (s) return res.json(s);
       }
 
       // Maybe it is a virtual directory (has children but no explicit entry)
-      const allKeys = await redis.hkeys(treeKey(tid));
+      const allKeys = await redis().hkeys(treeKey(tid));
       const prefix = relPath + '/';
       const hasChildren = allKeys.some(k => k.startsWith(prefix));
       if (hasChildren) {
@@ -215,7 +219,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
     try {
       // Inside a system plugin dir: if vault has no entries, list from repo
       if (inSysDir) {
-        const allKeys = await redis.hkeys(treeKey(tid));
+        const allKeys = await redis().hkeys(treeKey(tid));
         const sysPrefix = relPath + '/';
         const vaultHasEntries = allKeys.some(k => k.startsWith(sysPrefix));
         if (!vaultHasEntries) {
@@ -246,7 +250,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
 
       // Redis readdir: get all keys, filter to direct children of relPath
       const prefix = relPath ? relPath + '/' : '';
-      const allKeys = await redis.hkeys(treeKey(tid));
+      const allKeys = await redis().hkeys(treeKey(tid));
       const childMap = new Map();
 
       for (const key of allKeys) {
@@ -272,7 +276,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         } else {
           // Direct child — file
           if (!childMap.has(rest)) {
-            const raw = await redis.hget(treeKey(tid), key);
+            const raw = await redis().hget(treeKey(tid), key);
             const s = parseStats(raw);
             childMap.set(rest, {
               name: rest,
@@ -293,7 +297,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       for (const [name, entry] of childMap) {
         if (entry.isDirectory && !entry.stats) {
           const dirPath = prefix + name;
-          const raw = await redis.hget(treeKey(tid), dirPath);
+          const raw = await redis().hget(treeKey(tid), dirPath);
           const s = parseStats(raw);
           if (s) {
             entry.stats = {
@@ -352,7 +356,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       if (relPath === '.obsidian/community-plugins.json') {
         let list = [];
         try {
-          const raw = await redis.get(dataKey(tid, relPath));
+          const raw = await redis().get(dataKey(tid, relPath));
           if (raw) {
             const txt = typeof raw === 'string' ? raw : raw.toString('utf8');
             const parsed = JSON.parse(txt);
@@ -370,7 +374,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       // doesn't have it, serve from <repo>/plugins/.
       const systemPath = tryGetSystemFilePath(relPath);
       if (systemPath) {
-        const inRedis = await redis.hexists(treeKey(tid), relPath);
+        const inRedis = await redis().hexists(treeKey(tid), relPath);
         if (!inRedis) {
           if (encoding) {
             const data = await fsp.readFile(systemPath, encoding);
@@ -381,7 +385,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         }
       }
 
-      const content = await redis.get(dataKey(tid, relPath));
+      const content = await redis().get(dataKey(tid, relPath));
       if (content === null || content === undefined) {
         throw Object.assign(new Error('ENOENT: ' + relPath), { code: 'ENOENT' });
       }
@@ -428,7 +432,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         ? Buffer.byteLength(data, 'utf8')
         : (Buffer.isBuffer(data) ? data.length : 0);
 
-      const pipe = redis.pipeline();
+      const pipe = redis().pipeline();
       pipe.set(dataKey(tid, safe), contentStr);
       pipe.hset(treeKey(tid), safe, JSON.stringify(stats));
       await pipe.exec();
@@ -448,7 +452,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
     try {
       const safe = safePath(req.body.path || '');
       const stats = makeStats(safe, true);
-      await redis.hset(treeKey(tid), safe, JSON.stringify(stats));
+      await redis().hset(treeKey(tid), safe, JSON.stringify(stats));
       await ensureParentDirs(redis, tid, safe);
       invalidateBootstrapCache(tid);
       res.json({ ok: true });
@@ -463,7 +467,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
     const tid = getVaultId(req);
     try {
       const safe = safePath(req.query.path || '');
-      const pipe = redis.pipeline();
+      const pipe = redis().pipeline();
       pipe.del(dataKey(tid, safe));
       pipe.hdel(treeKey(tid), safe);
       await pipe.exec();
@@ -482,7 +486,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       const safe = safePath(req.query.path || '');
       const recursive = req.query.recursive === '1';
       const prefix = safe + '/';
-      const allKeys = await redis.hkeys(treeKey(tid));
+      const allKeys = await redis().hkeys(treeKey(tid));
       const toDelete = allKeys.filter(k => k === safe || k.startsWith(prefix));
 
       if (!recursive && toDelete.length > 1) {
@@ -491,7 +495,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         throw err;
       }
 
-      const pipe = redis.pipeline();
+      const pipe = redis().pipeline();
       for (const key of toDelete) {
         pipe.hdel(treeKey(tid), key);
         pipe.del(dataKey(tid, key));
@@ -512,7 +516,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       const oldPath = safePath(req.body.oldPath || '');
       const newPath = safePath(req.body.newPath || '');
 
-      const allKeys = await redis.hkeys(treeKey(tid));
+      const allKeys = await redis().hkeys(treeKey(tid));
       const prefix = oldPath + '/';
       const affected = allKeys.filter(k => k === oldPath || k.startsWith(prefix));
 
@@ -520,12 +524,12 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       const entries = [];
       for (const key of affected) {
         const newKey = newPath + key.slice(oldPath.length);
-        const stats = await redis.hget(treeKey(tid), key);
-        const data = await redis.get(dataKey(tid, key));
+        const stats = await redis().hget(treeKey(tid), key);
+        const data = await redis().get(dataKey(tid, key));
         entries.push({ key, newKey, stats, data });
       }
 
-      const pipe = redis.pipeline();
+      const pipe = redis().pipeline();
       for (const { key, newKey, stats, data } of entries) {
         if (stats) pipe.hset(treeKey(tid), newKey, stats);
         pipe.hdel(treeKey(tid), key);
@@ -550,19 +554,19 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       const src = safePath(req.body.src || '');
       const dest = safePath(req.body.dest || '');
 
-      const allKeys = await redis.hkeys(treeKey(tid));
+      const allKeys = await redis().hkeys(treeKey(tid));
       const prefix = src + '/';
       const affected = allKeys.filter(k => k === src || k.startsWith(prefix));
 
       const entries = [];
       for (const key of affected) {
         const newKey = dest + key.slice(src.length);
-        const stats = await redis.hget(treeKey(tid), key);
-        const data = await redis.get(dataKey(tid, key));
+        const stats = await redis().hget(treeKey(tid), key);
+        const data = await redis().get(dataKey(tid, key));
         entries.push({ newKey, stats, data });
       }
 
-      const pipe = redis.pipeline();
+      const pipe = redis().pipeline();
       for (const { newKey, stats, data } of entries) {
         if (stats) pipe.hset(treeKey(tid), newKey, stats);
         if (data !== null && data !== undefined) {

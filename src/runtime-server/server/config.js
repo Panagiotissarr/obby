@@ -64,6 +64,7 @@ module.exports = {
   host: process.env.HOST || '127.0.0.1',
   vaultPath: path.resolve(PROJECT_ROOT, process.env.VAULT_PATH || 'user-data/demo-vault'),
   registryPath: path.resolve(PROJECT_ROOT, process.env.VAULT_REGISTRY || 'user-data/registry.json'),
+  defaultVaultId: process.env.DEFAULT_VAULT_ID || '',
   obsidianMobilePath: OBSIDIAN_MOBILE_PATH,
   clientMobilePath: CLIENT_MOBILE_PATH,
   projectRoot: PROJECT_ROOT,

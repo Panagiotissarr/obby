@@ -75,6 +75,9 @@ function createApp(appConfig = {}) {
   try {
     const deployConfigPath = path.join(appConfig.projectRoot, 'src', 'config', 'deploy-config.json');
     const deployConfig = JSON.parse(fs.readFileSync(deployConfigPath, 'utf8'));
+    if (appConfig.defaultVaultId) {
+      deployConfig.defaultVaultId = appConfig.defaultVaultId;
+    }
     deployConfigSnippet = '<script>window.__owConfigInjected=' + JSON.stringify(deployConfig) + '</script>';
   } catch (err) {
     console.warn('[deploy-config] could not read src/config/deploy-config.json — window.__owConfig will use client-side DEFAULTS:', err.message);
