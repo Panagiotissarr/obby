@@ -1032,25 +1032,67 @@ const MOBILE_SCRIPTS = [
       function installRedisSyncMenu() {
         if (VAULT_TYPE !== 'server') return;
 
-        function doSave() {
-          if (!window.app || !window.app.vault) return;
-          var files = [];
-          var abstractFiles = window.app.vault.getFiles
-            ? Array.from(window.app.vault.getFiles())
-            : [];
-          abstractFiles.forEach(function (f) {
-            if (f && f.path && f.path.indexOf('.obsidian/plugins/') !== 0) {
-              var content = '';
-              try { content = window.app.vault.read(f); } catch (_) {}
-              files.push({ path: f.path, content: content });
+        async function doSave() {
+          if (!window.app || !window.app.vault || !window.app.vault.adapter) return;
+
+          if (typeof window.Notice === 'function') {
+            new window.Notice('Scanning files…');
+          }
+
+          var adapter = window.app.vault.adapter;
+          var allPaths = [];
+
+          async function walk(dir) {
+            try {
+              var list = await adapter.list(dir);
+              if (list && list.files) {
+                list.files.forEach(function (f) {
+                  if (f && f.indexOf('.obsidian/plugins/') !== 0) {
+                    allPaths.push(f);
+                  }
+                });
+              }
+              if (list && list.folders) {
+                for (var i = 0; i < list.folders.length; i++) {
+                  var d = list.folders[i];
+                  if (d !== '.git' && d.indexOf('.obsidian/plugins/') !== 0) {
+                    await walk(d);
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn('[ow] failed to list dir:', dir, e);
             }
+          }
+
+          await walk('');
+
+          if (typeof window.Notice === 'function') {
+            new window.Notice('Saving ' + allPaths.length + ' files to Redis…');
+          }
+
+          var filePromises = allPaths.map(async function (path) {
+            var content = '';
+            try {
+              content = await adapter.read(path);
+            } catch (_) {}
+            return { path: path, content: content };
           });
+
+          var files = await Promise.all(filePromises);
+
           fetch('/api/vault/save', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ vault: VAULT_ID, files: files }),
           })
-          .then(function (r) { return r.json(); })
+          .then(async function (r) {
+            var d = await r.json();
+            if (!r.ok) {
+              throw new Error(d.error || 'Server error ' + r.status);
+            }
+            return d;
+          })
           .then(function (d) {
             if (typeof window.Notice === 'function') {
               new window.Notice('Saved ' + (d.saved || 0) + ' files to Redis');
@@ -1071,7 +1113,13 @@ const MOBILE_SCRIPTS = [
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ vault: VAULT_ID }),
           })
-          .then(function (r) { return r.json(); })
+          .then(async function (r) {
+            var d = await r.json();
+            if (!r.ok) {
+              throw new Error(d.error || 'Server error ' + r.status);
+            }
+            return d;
+          })
           .then(function (d) {
             window.__owBootstrapCache = null;
             if (typeof window.Notice === 'function') {

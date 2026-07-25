@@ -19,34 +19,76 @@ function getVaultId() {
   return window.__owVaultId || window.VAULT_ID || '';
 }
 
-function doSave() {
+async function getAllFiles(adapter, dir = '') {
+  let files = [];
+  let list;
+  try {
+    list = await adapter.list(dir);
+  } catch (e) {
+    console.warn('[ow-sync] failed to list dir:', dir, e);
+    return [];
+  }
+
+  if (list && list.files) {
+    for (const f of list.files) {
+      if (f && f.indexOf('.obsidian/plugins/') !== 0) {
+        files.push(f);
+      }
+    }
+  }
+
+  if (list && list.folders) {
+    for (const d of list.folders) {
+      if (d === '.git' || d.indexOf('.obsidian/plugins/') === 0) {
+        continue;
+      }
+      const subFiles = await getAllFiles(adapter, d);
+      files = files.concat(subFiles);
+    }
+  }
+
+  return files;
+}
+
+async function doSave() {
   const vault = getVaultId();
   if (!vault) {
     new obsidian.Notice('No vault ID — cannot save');
     return;
   }
 
-  const files = [];
-  const abstractFiles = app.vault.getFiles
-    ? Array.from(app.vault.getFiles())
-    : [];
-
-  for (const f of abstractFiles) {
-    if (f && f.path && f.path.indexOf('.obsidian/plugins/') !== 0) {
-      let content = '';
-      try { content = app.vault.read(f); } catch (_) {}
-      files.push({ path: f.path, content });
-    }
+  if (!app.vault || !app.vault.adapter) {
+    new obsidian.Notice('Vault adapter not available');
+    return;
   }
 
-  new obsidian.Notice('Saving ' + files.length + ' files to Redis…');
+  new obsidian.Notice('Scanning files…');
+  const allPaths = await getAllFiles(app.vault.adapter);
+
+  new obsidian.Notice('Saving ' + allPaths.length + ' files to Redis…');
+
+  const filePromises = allPaths.map(async (path) => {
+    let content = '';
+    try {
+      content = await app.vault.adapter.read(path);
+    } catch (_) {}
+    return { path, content };
+  });
+
+  const files = await Promise.all(filePromises);
 
   fetch('/api/vault/save', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ vault, files }),
   })
-    .then(r => r.json())
+    .then(async (r) => {
+      const d = await r.json();
+      if (!r.ok) {
+        throw new Error(d.error || 'Server error ' + r.status);
+      }
+      return d;
+    })
     .then(d => {
       new obsidian.Notice('Saved ' + (d.saved || 0) + ' files to Redis');
       console.log('[ow-sync] save:', d);
@@ -71,7 +113,13 @@ function doSync() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ vault }),
   })
-    .then(r => r.json())
+    .then(async (r) => {
+      const d = await r.json();
+      if (!r.ok) {
+        throw new Error(d.error || 'Server error ' + r.status);
+      }
+      return d;
+    })
     .then(d => {
       window.__owBootstrapCache = null;
       new obsidian.Notice('Synced from Redis (' + (d.fileCount || 0) + ' files)');
@@ -90,6 +138,20 @@ module.exports = class ObsidianWebSyncPlugin extends obsidian.Plugin {
       console.log('[obsidian-web-sync] not on obsidian-web — plugin idle');
       return;
     }
+
+    // Auto-open Welcome note if it exists on startup
+    this.app.workspace.onLayoutReady(() => {
+      setTimeout(() => {
+        const welcomePath = '00 Dashboard/Welcome.md';
+        const file = this.app.vault.getAbstractFileByPath(welcomePath);
+        if (file) {
+          const leaf = this.app.workspace.getLeaf(false);
+          if (leaf) {
+            leaf.openFile(file);
+          }
+        }
+      }, 200);
+    });
 
     // ── Commands (Ctrl/Cmd+P) ──────────────────────────────────────────
     this.addCommand({

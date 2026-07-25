@@ -33,7 +33,7 @@ function createVaultSyncRouter(vaultRegistry) {
       for (const file of files) {
         if (!file.path) continue;
         const relPath = file.path;
-        const content = file.content || '';
+        const content = typeof file.content === 'string' ? file.content : '';
 
         // Write content
         pipe.set(dataKey(tid, relPath), content);
