@@ -340,10 +340,9 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
         if (r) {
           try {
             const raw = await r.get(dataKey(tid, relPath));
-            if (raw) {
-              const txt = typeof raw === 'string' ? raw : raw.toString('utf8');
-              const parsed = JSON.parse(txt);
-              if (Array.isArray(parsed)) list = parsed;
+            if (raw !== null && raw !== undefined) {
+              const arr = Array.isArray(raw) ? raw : JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8'));
+              if (Array.isArray(arr)) list = arr;
             }
           } catch (_) {}
         } else {
