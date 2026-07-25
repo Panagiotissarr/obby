@@ -67,36 +67,48 @@ async function doSave() {
 
   new obsidian.Notice('Saving ' + allPaths.length + ' files to Redis…');
 
-  const filePromises = allPaths.map(async (path) => {
-    let content = '';
+  // Read files in batches — each batch stays under 2MB to avoid Vercel 413
+  const BATCH_SIZE = 20;
+  let totalSaved = 0;
+  let totalErrors = 0;
+
+  for (let i = 0; i < allPaths.length; i += BATCH_SIZE) {
+    const batch = allPaths.slice(i, i + BATCH_SIZE);
+    const filePromises = batch.map(async (path) => {
+      let content = '';
+      try {
+        content = await app.vault.adapter.read(path);
+      } catch (_) {}
+      return { path, content };
+    });
+    const files = await Promise.all(filePromises);
+
     try {
-      content = await app.vault.adapter.read(path);
-    } catch (_) {}
-    return { path, content };
-  });
-
-  const files = await Promise.all(filePromises);
-
-  fetch('/api/vault/save', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ vault, files }),
-  })
-    .then(async (r) => {
+      const r = await fetch('/api/vault/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ vault, files }),
+      });
       const d = await r.json();
       if (!r.ok) {
         throw new Error(d.error || 'Server error ' + r.status);
       }
-      return d;
-    })
-    .then(d => {
-      new obsidian.Notice('Saved ' + (d.saved || 0) + ' files to Redis');
-      console.log('[ow-sync] save:', d);
-    })
-    .catch(e => {
-      new obsidian.Notice('Save failed: ' + e.message);
-      console.warn('[ow-sync] save failed', e);
-    });
+      totalSaved += d.saved || 0;
+      totalErrors += d.errors || 0;
+      console.log('[ow-sync] batch saved:', d.saved, 'files, errors:', d.errors);
+    } catch (e) {
+      totalErrors += files.length;
+      console.warn('[ow-sync] batch failed:', e.message);
+    }
+  }
+
+  if (totalErrors > 0) {
+    new obsidian.Notice('Saved ' + totalSaved + ' files (' + totalErrors + ' errors)');
+    console.warn('[ow-sync] save completed with errors: saved=' + totalSaved + ' errors=' + totalErrors);
+  } else {
+    new obsidian.Notice('Saved ' + totalSaved + ' files to Redis');
+    console.log('[ow-sync] save complete:', totalSaved);
+  }
 }
 
 async function doSync() {

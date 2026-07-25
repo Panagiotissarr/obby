@@ -376,15 +376,21 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       if (r) {
         const content = await r.get(dataKey(tid, relPath));
         if (content === null || content === undefined) throw Object.assign(new Error('ENOENT: ' + relPath), { code: 'ENOENT' });
-        if (encoding) {
-          res.type('text/plain; charset=utf-8').send(typeof content === 'string' ? content : JSON.stringify(content));
-        } else {
-          const raw = await r.hget(treeKey(tid), relPath);
-          const s = parseStats(raw);
-          if (s && s.encoding === 'base64') {
-            res.type('application/octet-stream').send(Buffer.from(typeof content === 'string' ? content : JSON.stringify(content), 'base64'));
+        const raw = await r.hget(treeKey(tid), relPath);
+        const s = parseStats(raw);
+        const isBase64 = s && s.encoding === 'base64';
+        if (isBase64) {
+          const bin = Buffer.from(typeof content === 'string' ? content : JSON.stringify(content), 'base64');
+          if (encoding) {
+            res.type('text/plain; charset=utf-8').send(bin.toString('utf8'));
           } else {
-            const str = typeof content === 'string' ? content : JSON.stringify(content);
+            res.type('application/octet-stream').send(bin);
+          }
+        } else {
+          const str = typeof content === 'string' ? content : JSON.stringify(content);
+          if (encoding) {
+            res.type('text/plain; charset=utf-8').send(str);
+          } else {
             res.type('application/octet-stream').send(Buffer.from(str));
           }
         }
