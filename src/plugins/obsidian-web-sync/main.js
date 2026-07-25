@@ -99,7 +99,7 @@ async function doSave() {
     });
 }
 
-function doSync() {
+async function doSync() {
   const vault = getVaultId();
   if (!vault) {
     new obsidian.Notice('No vault ID — cannot sync');
@@ -108,27 +108,39 @@ function doSync() {
 
   new obsidian.Notice('Syncing from Redis…');
 
-  fetch('/api/vault/refresh', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ vault }),
-  })
-    .then(async (r) => {
-      const d = await r.json();
-      if (!r.ok) {
-        throw new Error(d.error || 'Server error ' + r.status);
-      }
-      return d;
-    })
-    .then(d => {
-      window.__owBootstrapCache = null;
-      new obsidian.Notice('Synced from Redis (' + (d.fileCount || 0) + ' files)');
-      console.log('[ow-sync] sync:', d);
-    })
-    .catch(e => {
-      new obsidian.Notice('Sync failed: ' + e.message);
-      console.warn('[ow-sync] sync failed', e);
+  try {
+    const refreshRes = await fetch('/api/vault/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vault }),
     });
+    const refreshData = await refreshRes.json();
+    if (!refreshRes.ok) {
+      throw new Error(refreshData.error || 'Server error ' + refreshRes.status);
+    }
+
+    const bootstrapRes = await fetch(
+      '/api/bootstrap?vault=' + encodeURIComponent(vault) + '&full=1',
+      { headers: { 'Accept-Encoding': 'br, gzip' } },
+    );
+    if (bootstrapRes.ok) {
+      const data = await bootstrapRes.json();
+      if (data && !data.disabled) {
+        window.__owBootstrapCache = data;
+      } else {
+        window.__owBootstrapCache = null;
+      }
+    } else {
+      window.__owBootstrapCache = null;
+    }
+
+    const fileCount = refreshData.fileCount || 0;
+    new obsidian.Notice('Synced from Redis (' + fileCount + ' files)');
+    console.log('[ow-sync] sync:', refreshData);
+  } catch (e) {
+    new obsidian.Notice('Sync failed: ' + e.message);
+    console.warn('[ow-sync] sync failed', e);
+  }
 }
 
 module.exports = class ObsidianWebSyncPlugin extends obsidian.Plugin {

@@ -11,16 +11,22 @@
 const express = require('express');
 const { getRedis, treeKey, dataKey } = require('../redis');
 
+// Upstash REST pipelines have a max of ~1024 commands per request.
+// We stay well under the limit to avoid silent truncation.
+const PIPELINE_BATCH_SIZE = 200;
+
 function createVaultSyncRouter(vaultRegistry) {
   const router = express.Router();
 
   // ── POST /api/vault/save ───────────────────────────────────────────────
   // Body: { vault, files: [{ path, content, stats? }] }
-  // Writes every file to Redis in a single pipeline batch.
+  // Writes every file to Redis in batched pipeline calls.
   router.post('/save', express.json({ limit: '256mb' }), async (req, res) => {
     const { vault: vaultId, files } = req.body;
     const tid = vaultId || 'default';
     const redis = getRedis();
+
+    console.log('[vault-sync] save request: vault=' + tid + ', files=' + (Array.isArray(files) ? files.length : 'N/A'));
 
     if (!Array.isArray(files)) {
       return res.status(400).json({ error: 'files array required' });
@@ -28,7 +34,9 @@ function createVaultSyncRouter(vaultRegistry) {
 
     try {
       const now = Date.now();
-      const pipe = redis.pipeline();
+
+      // Collect all commands as [method, ...args] tuples first
+      const commands = [];
 
       for (const file of files) {
         if (!file.path) continue;
@@ -36,7 +44,7 @@ function createVaultSyncRouter(vaultRegistry) {
         const content = typeof file.content === 'string' ? file.content : '';
 
         // Write content
-        pipe.set(dataKey(tid, relPath), content);
+        commands.push({ op: 'set', args: [dataKey(tid, relPath), content] });
 
         // Write stats (use provided or generate)
         const stats = file.stats || {
@@ -50,7 +58,7 @@ function createVaultSyncRouter(vaultRegistry) {
           birthtime: now,
           mode: 0o100644,
         };
-        pipe.hset(treeKey(tid), relPath, JSON.stringify(stats));
+        commands.push({ op: 'hset', args: [treeKey(tid), relPath, JSON.stringify(stats)] });
 
         // Ensure parent directories exist
         const parts = relPath.split('/');
@@ -58,7 +66,7 @@ function createVaultSyncRouter(vaultRegistry) {
         let dir = '';
         for (const part of parts) {
           dir = dir ? dir + '/' + part : part;
-          pipe.hsetnx(treeKey(tid), dir, JSON.stringify({
+          commands.push({ op: 'hsetnx', args: [treeKey(tid), dir, JSON.stringify({
             isFile: false,
             isDirectory: true,
             isSymbolicLink: false,
@@ -68,11 +76,38 @@ function createVaultSyncRouter(vaultRegistry) {
             atime: now,
             birthtime: now,
             mode: 0o040755,
-          }));
+          })] });
         }
       }
 
-      await pipe.exec();
+      console.log('[vault-sync] total pipeline commands: ' + commands.length);
+
+      // Execute in batches to respect Upstash pipeline limits
+      let errors = 0;
+      for (let i = 0; i < commands.length; i += PIPELINE_BATCH_SIZE) {
+        const batch = commands.slice(i, i + PIPELINE_BATCH_SIZE);
+        const pipe = redis.pipeline();
+        for (const cmd of batch) {
+          pipe[cmd.op](...cmd.args);
+        }
+        const results = await pipe.exec();
+
+        // Check results for errors
+        if (Array.isArray(results)) {
+          for (const r of results) {
+            if (r && r.error) {
+              errors++;
+              if (errors <= 3) {
+                console.warn('[vault-sync] pipeline command error:', r.error);
+              }
+            }
+          }
+        }
+      }
+
+      if (errors > 0) {
+        console.warn('[vault-sync] ' + errors + ' pipeline command(s) failed');
+      }
 
       // Invalidate bootstrap cache so next read picks up fresh data
       try {
@@ -80,8 +115,10 @@ function createVaultSyncRouter(vaultRegistry) {
         if (serverCache) serverCache.delete(tid);
       } catch (_) {}
 
-      res.json({ ok: true, saved: files.length });
+      console.log('[vault-sync] save complete: vault=' + tid + ', saved=' + files.length + ', errors=' + errors);
+      res.json({ ok: true, saved: files.length, errors });
     } catch (err) {
+      console.error('[vault-sync] save failed:', err.message);
       res.status(500).json({ error: err.message });
     }
   });
@@ -94,6 +131,8 @@ function createVaultSyncRouter(vaultRegistry) {
     const tid = (req.body && req.body.vault) || 'default';
     const redis = getRedis();
 
+    console.log('[vault-sync] refresh request: vault=' + tid);
+
     try {
       // Invalidate bootstrap cache
       try {
@@ -103,8 +142,10 @@ function createVaultSyncRouter(vaultRegistry) {
 
       // Return fresh file count from Redis
       const keys = await redis.hkeys(treeKey(tid));
+      console.log('[vault-sync] refresh result: vault=' + tid + ', fileCount=' + keys.length);
       res.json({ ok: true, fileCount: keys.length });
     } catch (err) {
+      console.error('[vault-sync] refresh failed:', err.message);
       res.status(500).json({ error: err.message });
     }
   });
@@ -113,3 +154,4 @@ function createVaultSyncRouter(vaultRegistry) {
 }
 
 module.exports = createVaultSyncRouter;
+

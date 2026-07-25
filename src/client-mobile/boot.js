@@ -1107,32 +1107,45 @@ const MOBILE_SCRIPTS = [
           });
         }
 
-        function doRefresh() {
-          fetch('/api/vault/refresh', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault: VAULT_ID }),
-          })
-          .then(async function (r) {
-            var d = await r.json();
-            if (!r.ok) {
-              throw new Error(d.error || 'Server error ' + r.status);
+        async function doRefresh() {
+          try {
+            var refreshRes = await fetch('/api/vault/refresh', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ vault: VAULT_ID }),
+            });
+            var refreshData = await refreshRes.json();
+            if (!refreshRes.ok) {
+              throw new Error(refreshData.error || 'Server error ' + refreshRes.status);
             }
-            return d;
-          })
-          .then(function (d) {
-            window.__owBootstrapCache = null;
+
+            var bootstrapRes = await fetch(
+              '/api/bootstrap?vault=' + encodeURIComponent(VAULT_ID) + '&full=1',
+              { headers: { 'Accept-Encoding': 'br, gzip' } },
+            );
+            if (bootstrapRes.ok) {
+              var data = await bootstrapRes.json();
+              if (data && !data.disabled) {
+                window.__owBootstrapCache = data;
+              } else {
+                window.__owBootstrapCache = null;
+              }
+            } else {
+              window.__owBootstrapCache = null;
+            }
+
+            var fileCount = refreshData.fileCount || 0;
             if (typeof window.Notice === 'function') {
-              new window.Notice('Refreshed from Redis (' + (d.fileCount || 0) + ' files)');
+              new window.Notice('Refreshed from Redis (' + fileCount + ' files)');
             }
-            console.log('[ow] refresh from Redis:', d);
-          })
-          .catch(function (e) {
+            console.log('[ow] refresh from Redis:', refreshData);
+          } catch (e) {
+            window.__owBootstrapCache = null;
             if (typeof window.Notice === 'function') {
               new window.Notice('Refresh failed: ' + e.message);
             }
             console.warn('[ow] refresh failed', e);
-          });
+          }
         }
 
         // Context menu: register via Obsidian's workspace event
