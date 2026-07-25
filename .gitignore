@@ -41,3 +41,6 @@ Time-Garden
 
 # User vault folder
 myvault/
+
+# Local environment config
+.env

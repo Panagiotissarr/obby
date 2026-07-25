@@ -1,3 +1,5 @@
+require('dotenv').config({ path: require('path').resolve(__dirname, '..', '..', '..', '.env') });
+
 const path = require('path');
 
 // Repo root — three levels up from src/runtime-server/server/.
