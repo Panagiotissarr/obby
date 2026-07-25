@@ -150,6 +150,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       : err.code === 'ENOTDIR' ? 404
       : err.code === 'ENOVAULT' ? 404
       : 500;
+    if (status === 500) console.error('fs 500:', err.message, err.code, err.stack?.split('\n').slice(0, 3).join(' '));
     res.status(status).json({
       error: err.message,
       code: err.code || null,
@@ -199,7 +200,7 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
           const s = parseStats(raw);
           if (s) return res.json(s);
         }
-        const allKeys = await r.hkeys(treeKey(tid));
+        const allKeys = await r.hkeys(treeKey(tid)) || [];
         if (Array.isArray(allKeys)) {
           const prefix = relPath + '/';
           const hasChildren = allKeys.some(k => k.startsWith(prefix));
@@ -374,9 +375,18 @@ function createFsRouter(vaultRegistry, fallbackVaultRoot) {
       if (r) {
         const content = await r.get(dataKey(tid, relPath));
         if (content === null || content === undefined) throw Object.assign(new Error('ENOENT: ' + relPath), { code: 'ENOENT' });
-        const str = typeof content === 'string' ? content : JSON.stringify(content);
-        if (encoding) { res.type('text/plain; charset=utf-8').send(str); }
-        else { res.type('application/octet-stream').send(Buffer.from(str)); }
+        if (encoding) {
+          res.type('text/plain; charset=utf-8').send(typeof content === 'string' ? content : JSON.stringify(content));
+        } else {
+          const raw = await r.hget(treeKey(tid), relPath);
+          const s = parseStats(raw);
+          if (s && s.encoding === 'base64') {
+            res.type('application/octet-stream').send(Buffer.from(typeof content === 'string' ? content : JSON.stringify(content), 'base64'));
+          } else {
+            const str = typeof content === 'string' ? content : JSON.stringify(content);
+            res.type('application/octet-stream').send(Buffer.from(str));
+          }
+        }
       } else {
         var root = getVaultRoot(tid);
         var fullPath = path.join(root, relPath);
