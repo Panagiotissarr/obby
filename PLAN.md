@@ -8,22 +8,18 @@ untouched so we can swap in newer versions without forking.
 
 ```
 Browser
-├── src/client/ (our code, /)
-│   ├── index.html  - custom loader, defines script order
-│   ├── boot.js     - installs window.require + globals
-│   └── shims/      - one file per Node/Electron module we replace
-├── src/client-mobile/ (our code, /mobile)
-│   ├── index.html
-│   ├── boot.js
-│   └── shims/capacitor-shim.js  - 13 Capacitor plugins routed to /api/*
-└── vendor/ (extracted from Obsidian, never modified; gitignored)
-    ├── obsidian-desktop/  (desktop bundle)
+└── src/client-mobile/ (our code, / and /mobile)
+    ├── index.html
+    ├── boot.js
+    └── shims/capacitor-shim.js  - Capacitor plugins routed to /api/*
+vendor/ (extracted from Obsidian, never modified; gitignored)
     └── obsidian-mobile/   (mobile bundle, build-time patched)
 
 Server (src/runtime-server/server/)
 ├── index.js              - Express + WebSocket
 ├── vault-registry.js     - persistent recent-vault registry (user-data/registry.json)
 ├── system-plugins.js     - overlay from src/plugins/ into vault's .obsidian/plugins/
+├── redis.js              - Redis client, key helpers, getTreeEntries (corruption heal)
 ├── api/bootstrap.js      - single-shot preload: electron IPC + .obsidian/ + dirs cache
 ├── api/fs.js             - REST file system over HTTP (scoped per vault id)
 ├── api/electron.js       - stubs for ipcRenderer.sendSync channels
@@ -35,35 +31,53 @@ Vault
 └── plain Markdown files (the user's actual content)
 ```
 
-### Two parallel client runtimes — `src/client/` vs `src/client-mobile/`
+### Client runtime
 
-The same Node.js server (`src/runtime-server/server/`) hosts two completely separate browser
-runtimes that share its API:
+The Node.js server (`src/runtime-server/server/`) hosts a single browser
+runtime: the **mobile bundle** (`vendor/obsidian-mobile/app.js`) served at
+both `/` and `/mobile`. The desktop runtime (`src/client/`) was removed in
+the `collapse-desktop` slice — see git history and `archive/desktop-runtime`
+tag if needed.
 
-| Route | Bundle loaded | Adapter chosen | Shim layer | Use case |
-|---|---|---|---|---|
-| `/` | `vendor/obsidian-desktop/app.js` (desktop) | `FileSystemAdapter` via `original-fs` shim | `src/client/shims/*` (electron, original-fs, ipcRenderer, …) | Legacy fallback; desktop-class plugin compatibility (full Node API surface). |
-| `/mobile` | `vendor/obsidian-mobile/app.js` (Android APK bundle) | `CapacitorAdapter` via `capacitor-shim.js` | `src/client-mobile/shims/capacitor-shim.js` + minimal node shims (path, url, os, crypto, …) | Preferred runtime. Uses Obsidian's mobile codepaths (no sync XHR, no Electron assumptions). Layout (mobile/desktop UI) chosen at boot via `__owPlatformOverrides`. |
+| Route | Bundle loaded | Adapter | Notes |
+|---|---|---|---|
+| `/` | `vendor/obsidian-mobile/app.js` | `CapacitorAdapter` via `capacitor-shim.js` | Primary route |
+| `/mobile` | same | same | Backwards-compatible alias |
 
-```
-                  ┌── /         → src/client/index.html        → desktop bundle + electron shims
-Browser → server ─┤
-                  └── /mobile   → src/client-mobile/index.html → mobile bundle + Capacitor shim
-                        │
-                        ├── share /api/*  (fs, watch, bootstrap, vaults, electron)
-                        └── share vendor/obsidian-desktop/* and vendor/obsidian-mobile/* static assets
-```
+Build-time patches on `app.js` expose `window.__owPlatform` and
+`window.__owPlatformOverrides` so `client-mobile/boot.js` can choose
+desktop or mobile UI layout via `localStorage['obsidian-web:layout-mode']`.
+`isMobileApp` stays `true` (Capacitor adapter always active); only the
+`isMobile` flag (UI layout) is toggled.
 
-**Default recommendation:** `/mobile`. It's lighter (3.6 MB bundle vs 7+ MB),
-has no sync XHR (so no deprecation pressure), and the build-time Platform
-patches let it serve both desktop and mobile UI layouts via the layout switcher
-plugin. The desktop runtime stays available for plugins that need full Node/
-Electron surface (e.g. obsidian-git that shells out to `git`).
+### Redis data model
 
-**Long-term plan:** keep both. Removing the desktop runtime would lose
-plugin compatibility for any plugin that touches Electron `remote` or
-`child_process`. See `docs/investigations.md` for the deep dive on what
-each adapter expects.
+- `vault:{vaultId}:tree` — Hash: `relPath` → `JSON {mtime, size, isFile, isDirectory}`
+- `vault:{vaultId}:data:{relPath}` — String (file content)
+- `vault:index` — JSON array of vault IDs
+
+### Vercel deployment
+
+The primary deployment runs on Vercel as a serverless function:
+
+- **Project:** `obby` at `note.sarris.dev`
+- **Entry:** `api/index.js` (Express app, all routes through `vercel.json`)
+- **Storage:** Upstash Redis (via `KV_REST_API_URL` + `KV_REST_API_TOKEN`)
+- **Build:** `installCommand` runs the updater + server npm install; `vercel-build` (root `package.json`) runs the updater again (redundant but harmless)
+- **Build function config:** max 30s, includes `{vendor,src/client-mobile,src/plugins,src/config}/**`
+- **GitHub rate limiting:** `update-obsidian-mobile.js` fetches from GitHub API unauthenticated. On Vercel, the shared IP hits 60 req/hr. Set `GITHUB_TOKEN` (classic, no scopes) in Vercel env vars for 5000 req/hr.
+
+### Bootstrap cache
+
+Server-side (`src/runtime-server/server/api/bootstrap.js`): `/api/bootstrap` returns `{electron, fs, dirs}` — all files, stats, directory listings in one compressed response. Server caches in `serverCache` Map. Invalidated on vault writes.
+
+Client-side (`src/client-mobile/bootstrap-lookup.js`): `window.__owBootstrapCache` set by `boot.js` from the bootstrap response. `lookupDir`, `lookupStat`, `lookupContent` are pure helpers that answer `readdir`/`stat`/`readFile` from cache.
+
+**Critical:** `readdir` in `capacitor-shim.js` now **bypasses the bootstrap cache** and always hits `/api/fs/readdir`. The bootstrap cache is still used for `stat` and `readFile`.
+
+### Tree corruption handling
+
+`getTreeEntries()` (`src/runtime-server/server/redis.js:66`) handles numeric-key flattening corruption (`Object.entries(hgetall).flat()` written back as positional pairs). Detects and reconstructs on every read. No write-back.
 
 ## Status
 
@@ -177,18 +191,14 @@ See `docs/investigations.md` for solved issues and debugging notes.
 - **Obsidian Sync.** Will not work - it's a paid Electron-only service.
   The web wrapper effectively replaces it: every device uses the same
   server-side vault.
-- **Mobile.** Implemented as `/mobile` — a parallel runtime that loads
+- **Mobile.** The only runtime — served at both `/` and `/mobile`. Loads
   the mobile bundle (`obsidian-mobile/app.js`) with a `CapacitorAdapter`
-  shim instead of the desktop FileSystemAdapter. Three build-time
-  patches on the bundle (applied by `scripts/update-obsidian-mobile.js`
-  via `scripts/patch-obsidian-mobile.js`) expose the Platform object as
+  shim. Build-time patches on the bundle expose the Platform object as
   `window.__owPlatform` and let `client-mobile/boot.js` choose the
   layout via `window.__owPlatformOverrides` based on
   `localStorage['obsidian-web:layout-mode']` (auto / mobile / desktop).
   `isMobileApp` stays `true` so the Capacitor adapter is always active;
   only the `isMobile` flag (which controls UI layout) is toggled.
-  See `docs/walkthrough.md` (2026-05-11) and `docs/investigations.md`
-  ("Build-time patch approach (implemented)").
 
 ---
 
@@ -509,8 +519,13 @@ Add a `docs/livesync.md` guide covering:
 
 | File | Purpose |
 |------|---------|
+| `src/client-mobile/shims/capacitor-shim.js` | Main Capacitor shim: `readdir`, `stat`, `readFile`, `watchAndStatAll`, `mkdir`, `rename`, etc. |
+| `src/client-mobile/boot.js` | Boot sequence: vault resolution, bootstrap fetch, script injection, rescan |
+| `src/client-mobile/bootstrap-lookup.js` | Pure helpers: `lookupDir`, `lookupStat`, `lookupContent` over cache |
+| `src/client-mobile/cache-invalidation.js` | Cache mutation helpers for writes |
 | `src/runtime-server/server/index.js` | HTTP/WS entry point; triggers bootstrap warm-up on listen |
-| `src/runtime-server/server/config.js` | port, host, vault path, obsidian path |
+| `src/runtime-server/server/config.js` | port, host, vault path, obsidian path, cache-bust computation |
+| `src/runtime-server/server/redis.js` | Redis client, key helpers, `getTreeEntries` (corruption heal) |
 | `src/runtime-server/server/vault-registry.js` | persistent recent-vault registry |
 | `src/runtime-server/server/system-plugins.js` | overlay from `src/plugins/` into vault's `.obsidian/plugins/` |
 | `src/runtime-server/server/api/bootstrap.js` | single-shot preload endpoint; server-side mtime cache; pre-compression |
@@ -519,25 +534,20 @@ Add a `docs/livesync.md` guide covering:
 | `src/runtime-server/server/api/electron.js` | sendSync channel handlers |
 | `src/runtime-server/server/api/proxy.js` | outbound HTTP proxy for Obsidian release/asset hosts |
 | `src/runtime-server/server/api/watch.js` | chokidar bridge (per-connection vault watcher) |
-| `src/client/index.html` | script load order |
-| `src/client/starter.html` | wrapped Obsidian starter entry |
-| `src/client/boot.js` | window.require, modules table, platform globals |
-| `src/client/shims/sync-http.js` | sync XMLHttpRequest helpers |
-| `src/client/shims/original-fs.js` | fs over HTTP |
-| `src/client/shims/electron.js` | ipcRenderer + remote stubs |
-| `src/client/shims/path.js` | POSIX path utilities |
-| `src/client/shims/url.js` | pathToFileURL, fileURLToPath |
-| `src/client/shims/os.js` | tmpdir, hostname, etc. |
-| `src/client/shims/btime.js` | birthtime stub (no-op) |
-| `src/client-mobile/` | mobile-runtime client (boot.js + capacitor shim + index.html for `/mobile`) |
 | `src/plugins/obsidian-web-layout/` | system-plugin: ribbon + commands to switch mobile/desktop layout |
 | `src/deployments/cloudflare/` | Cloudflare Workers deployment (Worker + Durable Object + build script) |
-| `vendor/obsidian-desktop/` | extracted desktop bundle, untouched |
 | `vendor/obsidian-mobile/` | extracted mobile bundle, patched at build time (4 patches) |
+| `vendor/obsidian-desktop/` | extracted desktop bundle, vestigial (kept for scripts/update-obsidian-desktop.js) |
 | `user-data/demo-vault/` | example vault shipped with the repo |
 | `user-data/registry.json` | recent-vaults registry (gitignored, runtime) |
 | `.tmp/` | build artifacts + intermediate (folder tracked, contents gitignored) |
-| `scripts/update-obsidian-desktop.js` | downloads asar, extracts desktop bundle to `vendor/obsidian-desktop/` |
 | `scripts/update-obsidian-mobile.js` | downloads APK, extracts mobile bundle, applies patches |
 | `scripts/patch-obsidian-mobile.js` | 4 regex patches exposing `__owPlatform`, `__owPlatformOverrides`, and the desktop vault-profile panel |
+| `scripts/update-obsidian-desktop.js` | vestigial — downloads desktop bundle (no longer served) |
 | `test-vault/` | scratch vault for development |
+
+## Known quirks
+
+- WebSocket (`/api/watch`) fails on Vercel (serverless) — expected.
+- `/obsidian/static/*` 404s — Obsidian tries to read its own files from `/obsidian/static/` which doesn't exist as a static route. Some fall through to `/api/fs/read`.
+- `node_modules/` under `src/runtime-server/server/` is NOT gitignored (tracked in repo for Vercel).

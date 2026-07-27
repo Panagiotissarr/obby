@@ -22,13 +22,13 @@ The browser version can load faster than the desktop app. Instead of Obsidian re
 
 ### Two deployment modes
 
-| | **Node.js server** | **Cloudflare Workers** |
-|---|---|---|
-| Path | `src/runtime-server/server/` | `src/deployments/cloudflare/` |
-| Storage | Real filesystem | Durable Object (in-memory) |
-| Persistence | Full | R2 (optional) or reset every N hours |
-| Use case | Personal use, self-hosted | Public demo, zero-maintenance |
-| URL | `http://localhost:3000` | [obsidian-web.tzlev.ovh](https://obsidian-web.tzlev.ovh) |
+| | **Node.js server** | **Vercel** | **Cloudflare Workers** |
+|---|---|---|---|
+| Path | `src/runtime-server/server/` | `api/index.js` (serverless) | `src/deployments/cloudflare/` |
+| Storage | Real filesystem | Upstash Redis | Durable Object (in-memory) |
+| Persistence | Full | Full (Redis) | R2 (optional) or reset every N hours |
+| Use case | Personal use, self-hosted | Production (note.sarris.dev) | Public demo, zero-maintenance |
+| URL | `http://localhost:3000` | [note.sarris.dev](https://note.sarris.dev) | [obsidian-web.tzlev.ovh](https://obsidian-web.tzlev.ovh) |
 
 ## Repo layout
 
@@ -119,23 +119,25 @@ Server environment variables:
 - `VAULT_PATH`: vault path relative to the project root or absolute, default `user-data/demo-vault`.
 - `VAULT_REGISTRY`: recent-vault registry JSON path, default `user-data/registry.json`.
 
+### Vercel environment variables
+
+Required for Vercel deployment:
+
+- `KV_REST_API_URL`: Upstash Redis REST URL.
+- `KV_REST_API_TOKEN`: Upstash Redis REST token.
+- `GITHUB_TOKEN`: GitHub personal access token (classic, no scopes) — raises API rate limit from 60 to 5000 req/hr for `update-obsidian-mobile.js` during builds.
+
 ### Bootstrap configuration
 
 The `/api/bootstrap` endpoint preloads vault content into memory for fast
 boot. Both `/` and `/mobile` (the same runtime) consume it. Defaults work
 for most vaults. To customize:
 
-- `BOOTSTRAP_DISABLED=true` — skip the bootstrap entirely. Each FS read
-  goes individually over HTTP. Useful for minimal deployments where the
-  precompute is not worth it. Cold boot of a large vault drops back to
-  ~20s; with bootstrap enabled it is ~2-3s.
-- `BOOTSTRAP_MAX_FILE_KB=500` — skip individual files larger than this
-  from the cache (default: 500 KB). Their stat is still cached; content
-  is fetched on demand.
-- `BOOTSTRAP_MAX_TOTAL_MB=50` — cap the total uncompressed response size
-  (default: 50 MB). When reached, server stops adding content but still
-  returns dirs+stat for the remaining files. Response carries
-  `capped: true` and `cappedReason`.
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `BOOTSTRAP_DISABLED` | — | Skip bootstrap entirely (every FS read is individual HTTP) |
+| `BOOTSTRAP_MAX_FILE_KB` | 500 | Skip content for files over this size |
+| `BOOTSTRAP_MAX_TOTAL_MB` | 50 | Cap total uncompressed response |
 
 ## Deployment
 
@@ -206,6 +208,16 @@ The Node.js server (`src/runtime-server/server/`) can be deployed to any Linux b
 3. Put it behind a reverse proxy (nginx, Caddy, Cloudflare Tunnel) with HTTPS
 4. Do not expose the server directly to the internet without auth — there is no application-level authentication
 
+## Vercel deployment
+
+The primary production deployment runs on Vercel with Upstash Redis:
+
+1. Connect the repo to Vercel
+2. Set environment variables: `KV_REST_API_URL`, `KV_REST_API_TOKEN`, and optionally `GITHUB_TOKEN`
+3. Deploy — `vercel.json` routes all requests through `api/index.js`
+
+The build function runs `update-obsidian-mobile.js` to extract the renderer bundle. Max build time is 30s; includes `{vendor,src/client-mobile,src/plugins,src/config}/**`.
+
 ## Notes
 
 - Obsidian's extracted files are treated as third-party artifacts. Do not edit files under `vendor/obsidian-mobile/`; update wrappers/shims instead.
@@ -217,6 +229,9 @@ The Node.js server (`src/runtime-server/server/`) can be deployed to any Linux b
   in the `collapse-desktop` slice). They are left in place rather than deleted; if you don't
   already have `vendor/obsidian-desktop/` populated, you don't need it — everything now runs on
   `vendor/obsidian-mobile/`.
+- `node_modules/` under `src/runtime-server/server/` is NOT gitignored (tracked in repo for Vercel).
+- WebSocket (`/api/watch`) fails on Vercel (serverless) — expected.
+- `/obsidian/static/*` 404s — Obsidian tries to read its own files from `/obsidian/static/` which doesn't exist as a static route. Some fall through to `/api/fs/read`.
 
 ## Disclaimer
 
